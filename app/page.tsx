@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useMemo, useRef } from "react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
 import {
   Search,
   RotateCcw,
@@ -9,6 +9,7 @@ import {
   CheckCircle2,
   PackageX,
   History as HistoryIcon,
+  Database,
 } from "lucide-react";
 import { Header } from "@/components/Header";
 import { BottomNav, NavTab } from "@/components/BottomNav";
@@ -23,6 +24,11 @@ import {
   InventoryMovementRecord,
 } from "@/lib/mock-data";
 import { useLanguage } from "@/lib/language-context";
+import {
+  fetchShowroomProducts,
+  executeStockChange,
+  fetchMovementHistory,
+} from "@/lib/services/inventory-service";
 
 /**
  * BEGINNER LESSON: Next.js Client Component ("use client")
@@ -45,11 +51,35 @@ export default function HomePage() {
   const [selectedCategory, setSelectedCategory] = useState<CategoryFilter>("all");
   const searchInputRef = useRef<HTMLInputElement>(null);
 
-  // Live Inventory State (starts with initial electronics showroom mock data)
+  // Live Inventory State (defaults to initial electronics showroom mock data, then loads from Supabase)
   const [products, setProducts] = useState<ProductItem[]>(INITIAL_PRODUCTS);
+  const [isLiveFromSupabase, setIsLiveFromSupabase] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
 
   // Inventory Movements History Log
   const [movements, setMovements] = useState<InventoryMovementRecord[]>([]);
+
+  // Load real catalog & movements from Supabase on start
+  useEffect(() => {
+    async function loadInitialData() {
+      setIsLoading(true);
+      try {
+        const prodResult = await fetchShowroomProducts();
+        setProducts(prodResult.products);
+        setIsLiveFromSupabase(prodResult.isFromSupabase);
+
+        const histResult = await fetchMovementHistory();
+        if (histResult.length > 0) {
+          setMovements(histResult);
+        }
+      } catch (err) {
+        console.warn("Could not load from Supabase, using local defaults:", err);
+      } finally {
+        setIsLoading(false);
+      }
+    }
+    loadInitialData();
+  }, []);
 
   // Confirmation Dialog State
   const [dialogState, setDialogState] = useState<{
@@ -119,7 +149,7 @@ export default function HomePage() {
     const previousStock = targetProduct.currentStock;
     const newStock = Math.max(0, previousStock + quantityChange); // Rule: Stock can NEVER go below 0
 
-    // Update Product list
+    // Update Product list locally for immediate feedback
     setProducts((prev) =>
       prev.map((item) =>
         item.id === targetProduct.id
@@ -131,6 +161,19 @@ export default function HomePage() {
           : item
       )
     );
+
+    // Sync atomically with Supabase PostgreSQL if connected
+    executeStockChange({
+      variantId: targetProduct.id,
+      changeQty: quantityChange,
+      reason: type === "sale" ? "sale" : "return",
+      performedBy: mode === "update" ? "Owner" : "Showroom Staff",
+      notes: type === "sale" ? "Customer Sale" : "Customer Return",
+    }).then((res) => {
+      if (!res.success && res.error) {
+        console.warn("Supabase update error:", res.error);
+      }
+    });
 
     // Record movement in history
     const newMovement: InventoryMovementRecord = {
@@ -175,12 +218,25 @@ export default function HomePage() {
 
     const { product, previousStock } = lastAction;
 
-    // Revert stock
+    // Revert stock locally
     setProducts((prev) =>
       prev.map((item) =>
         item.id === product.id ? { ...item, currentStock: previousStock } : item
       )
     );
+
+    // Sync undo with Supabase PostgreSQL
+    executeStockChange({
+      variantId: product.id,
+      changeQty: previousStock - lastAction.newStock,
+      reason: "manual_correction",
+      performedBy: mode === "update" ? "Owner" : "Showroom Staff",
+      notes: "Undo Last Action",
+    }).then((res) => {
+      if (!res.success && res.error) {
+        console.warn("Supabase undo error:", res.error);
+      }
+    });
 
     // Record undo movement
     const undoMovement: InventoryMovementRecord = {
@@ -239,9 +295,9 @@ export default function HomePage() {
       />
 
       <main className="max-w-5xl mx-auto px-4 pt-4 flex flex-col gap-4">
-        {/* Check Mode vs Update Mode Notice Bar */}
+        {/* Check Mode vs Update Mode Notice Bar + Database Status */}
         <div
-          className={`flex items-center justify-between px-3.5 py-2 rounded-xl text-xs font-medium border ${
+          className={`flex items-center justify-between px-3.5 py-2 rounded-xl text-xs font-medium border flex-wrap gap-2 ${
             mode === "check"
               ? "bg-emerald-50/90 border-emerald-200 text-emerald-900"
               : "bg-amber-50/90 border-amber-300 text-amber-950 font-semibold"
@@ -259,14 +315,36 @@ export default function HomePage() {
                 : "Owner Update Mode unlocked: Ready for stock & price updates."}
             </span>
           </div>
-          {mode === "check" && (
-            <button
-              onClick={() => setIsPinModalOpen(true)}
-              className="font-bold underline text-emerald-800 hover:text-emerald-950 shrink-0 ml-2"
+
+          <div className="flex items-center gap-2 ml-auto">
+            {/* Supabase Connection Status Pill */}
+            <span
+              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold border ${
+                isLiveFromSupabase
+                  ? "bg-emerald-100 text-emerald-800 border-emerald-300"
+                  : "bg-slate-100 text-slate-600 border-slate-300"
+              }`}
+              title={isLiveFromSupabase ? "Connected to Supabase PostgreSQL" : "Using local data until Supabase is connected"}
             >
-              {lang === "hi" ? "पिन डालें" : "Owner PIN"}
-            </button>
-          )}
+              <Database className="w-3 h-3" />
+              <span>
+                {isLiveFromSupabase
+                  ? "Supabase Live"
+                  : isLoading
+                  ? "Connecting..."
+                  : "Demo Catalog"}
+              </span>
+            </span>
+
+            {mode === "check" && (
+              <button
+                onClick={() => setIsPinModalOpen(true)}
+                className="font-bold underline text-emerald-800 hover:text-emerald-950 shrink-0"
+              >
+                {lang === "hi" ? "पिन डालें" : "Owner PIN"}
+              </button>
+            )}
+          </div>
         </div>
 
         {/* 2. Big Blinkit-Style Search Bar */}
