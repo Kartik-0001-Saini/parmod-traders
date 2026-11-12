@@ -1,0 +1,94 @@
+name: Weekly Database Backup
+
+on:
+  # Runs every Monday at 03:00 AM IST (Sunday 21:30 UTC)
+  schedule:
+    - cron: '30 21 * * 0'
+
+  # Allows manual 1-click trigger from GitHub Actions tab anytime
+  workflow_dispatch:
+
+jobs:
+  backup-database:
+    name: Run pg_dump & Save Artifact
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate Secret Configuration
+        run: |
+          if [ -z "${{ secrets.SUPABASE_DB_URL }}" ]; then
+            echo "❌ Error: SUPABASE_DB_URL secret is missing in GitHub repository settings!"
+            echo "Please add SUPABASE_DB_URL under Settings -> Secrets and variables -> Actions"
+            exit 1
+          fi
+          echo "✅ SUPABASE_DB_URL secret detected."
+
+      - name: Install PostgreSQL Client 16
+        run: |
+          echo "Installing matching PostgreSQL 16 client tools..."
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y -qq postgresql-client-16
+          pg_dump --version
+
+      - name: Generate Timestamp
+        id: meta
+        run: |
+          TIMESTAMP=$(date -u +"%Y-%m-%d_%H%M%S_UTC")
+          DATE_ONLY=$(date -u +"%Y-%m-%d")
+          echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
+          echo "date=$DATE_ONLY" >> $GITHUB_OUTPUT
+          echo "filename=parmod_traders_backup_${TIMESTAMP}.sql.gz" >> $GITHUB_OUTPUT
+
+      - name: Execute pg_dump (Session Pooler IPv4)
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          FILENAME: ${{ steps.meta.outputs.filename }}
+        run: |
+          echo "Connecting to Supabase via Session Pooler and creating compressed dump..."
+          
+          # Dump parameters:
+          # --clean --if-exists: Adds DROP TABLE IF EXISTS before CREATE, making restore idempotent
+          # --no-owner: Prevents role ownership conflicts when restoring into different database
+          # --no-privileges: Skips dumping custom grants so restore doesn't require superuser
+          # gzip -9: Maximum compression
+          pg_dump "$SUPABASE_DB_URL" \
+            --clean \
+            --if-exists \
+            --no-owner \
+            --no-privileges \
+            --format=plain | gzip -9 > "$FILENAME"
+
+      - name: Verify Backup Integrity & File Size
+        env:
+          FILENAME: ${{ steps.meta.outputs.filename }}
+        run: |
+          if [ ! -f "$FILENAME" ]; then
+            echo "❌ Error: Backup file $FILENAME was not created!"
+            exit 1
+          fi
+
+          FILESIZE=$(stat -c%s "$FILENAME")
+          echo "Backup file size: $FILESIZE bytes ($((FILESIZE / 1024)) KB)"
+
+          # Real showroom schema with migrations must be larger than 5 KB
+          if [ "$FILESIZE" -lt 5000 ]; then
+            echo "❌ Error: Backup file is abnormally small ($FILESIZE bytes). Dump likely failed!"
+            # Inspect first few uncompressed lines for error messages
+            gunzip -c "$FILENAME" | head -n 30 || true
+            exit 1
+          fi
+
+          # Verify gzip archive integrity
+          gzip -t "$FILENAME"
+          echo "✅ Gzip archive integrity check passed."
+          echo "✅ Backup successfully verified: $FILENAME"
+
+      - name: Upload Backup to GitHub Artifacts (Retained for 90 Days)
+        uses: actions/upload-artifact@v4
+        with:
+          name: supabase-backup-${{ steps.meta.outputs.date }}
+          path: ${{ steps.meta.outputs.filename }}
+          retention-days: 90
+          if-no-files-found: error
