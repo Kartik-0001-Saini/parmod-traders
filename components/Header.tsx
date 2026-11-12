@@ -1,17 +1,25 @@
 "use client";
 
 import React from "react";
-import { ShieldCheck, KeyRound, Globe, Store } from "lucide-react";
+import { ShieldCheck, KeyRound, Globe, Store, User, Crown } from "lucide-react";
 import { useLanguage } from "@/lib/language-context";
+import { useAuth } from "@/lib/auth-context";
 
 interface HeaderProps {
   mode: "check" | "update";
   onOpenPinModal: () => void;
   onSwitchToCheckMode: () => void;
+  onOpenAuthModal: () => void;
 }
 
-export function Header({ mode, onOpenPinModal, onSwitchToCheckMode }: HeaderProps) {
+export function Header({
+  mode,
+  onOpenPinModal,
+  onSwitchToCheckMode,
+  onOpenAuthModal,
+}: HeaderProps) {
   const { lang, toggleLang, t } = useLanguage();
+  const { isAuthenticated, role } = useAuth();
 
   return (
     <header className="sticky top-0 z-40 bg-white/95 backdrop-blur-md border-b border-slate-200 px-4 py-3 shadow-xs">
@@ -36,8 +44,39 @@ export function Header({ mode, onOpenPinModal, onSwitchToCheckMode }: HeaderProp
           </div>
         </div>
 
-        {/* Right Action Controls: Mode Badge + Language Toggle */}
-        <div className="flex items-center gap-2">
+        {/* Right Action Controls: User Auth + Mode Badge + Language Toggle */}
+        <div className="flex items-center gap-1.5 sm:gap-2">
+          {/* User Auth State Button */}
+          {isAuthenticated ? (
+            <button
+              onClick={onOpenAuthModal}
+              title={role === "owner" ? "Owner Account" : "Staff Account"}
+              className={`flex items-center gap-1 px-2.5 py-1.5 rounded-full text-xs font-bold transition-all active:scale-95 border ${
+                role === "owner"
+                  ? "bg-amber-50 text-amber-900 border-amber-300 hover:bg-amber-100"
+                  : "bg-emerald-50 text-emerald-900 border-emerald-300 hover:bg-emerald-100"
+              }`}
+            >
+              {role === "owner" ? (
+                <Crown className="w-3.5 h-3.5 text-amber-600" />
+              ) : (
+                <User className="w-3.5 h-3.5 text-emerald-600" />
+              )}
+              <span className="hidden sm:inline">
+                {role === "owner" ? (lang === "hi" ? "मालिक" : "Owner") : (lang === "hi" ? "स्टाफ" : "Staff")}
+              </span>
+            </button>
+          ) : (
+            <button
+              onClick={onOpenAuthModal}
+              title="Staff or Owner Login"
+              className="flex items-center gap-1 px-2.5 py-1.5 rounded-full bg-slate-900 text-white text-xs font-bold hover:bg-slate-800 transition-colors shadow-2xs active:scale-95"
+            >
+              <User className="w-3.5 h-3.5" />
+              <span>{lang === "hi" ? "लॉगिन" : "Login"}</span>
+            </button>
+          )}
+
           {/* Mode Badge Button */}
           {mode === "check" ? (
             <button

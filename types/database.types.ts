@@ -6,14 +6,20 @@ export type Json =
   | { [key: string]: Json | undefined }
   | Json[];
 
+export type UserRole = "owner" | "staff";
+
 export interface Database {
   public: {
+    Views: {
+      [_ in never]: never;
+    };
     Tables: {
       profiles: {
+        Relationships: [];
         Row: {
           id: string;
           email: string | null;
-          role: "owner" | "staff";
+          role: UserRole;
           full_name: string | null;
           created_at: string;
           updated_at: string;
@@ -21,7 +27,7 @@ export interface Database {
         Insert: {
           id: string;
           email?: string | null;
-          role?: "owner" | "staff";
+          role?: UserRole;
           full_name?: string | null;
           created_at?: string;
           updated_at?: string;
@@ -29,13 +35,14 @@ export interface Database {
         Update: {
           id?: string;
           email?: string | null;
-          role?: "owner" | "staff";
+          role?: UserRole;
           full_name?: string | null;
           created_at?: string;
           updated_at?: string;
         };
       };
       categories: {
+        Relationships: [];
         Row: {
           id: string;
           name: string;
@@ -68,6 +75,7 @@ export interface Database {
         };
       };
       category_attributes: {
+        Relationships: [];
         Row: {
           id: string;
           category_id: string;
@@ -100,6 +108,7 @@ export interface Database {
         };
       };
       products: {
+        Relationships: [];
         Row: {
           id: string;
           category_id: string;
@@ -135,6 +144,7 @@ export interface Database {
         };
       };
       product_variants: {
+        Relationships: [];
         Row: {
           id: string;
           product_id: string;
@@ -146,7 +156,6 @@ export interface Database {
           low_stock_threshold: number;
           selling_price: number;
           mrp: number;
-          latest_purchase_price: number | null;
           last_verified_at: string;
           is_active: boolean;
           is_test_seed: boolean;
@@ -164,7 +173,6 @@ export interface Database {
           low_stock_threshold?: number;
           selling_price: number;
           mrp: number;
-          latest_purchase_price?: number | null;
           last_verified_at?: string;
           is_active?: boolean;
           is_test_seed?: boolean;
@@ -182,7 +190,6 @@ export interface Database {
           low_stock_threshold?: number;
           selling_price?: number;
           mrp?: number;
-          latest_purchase_price?: number | null;
           last_verified_at?: string;
           is_active?: boolean;
           is_test_seed?: boolean;
@@ -190,7 +197,32 @@ export interface Database {
           updated_at?: string;
         };
       };
+      product_costs: {
+        Relationships: [];
+        Row: {
+          id: string;
+          variant_id: string;
+          purchase_price: number;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: {
+          id?: string;
+          variant_id: string;
+          purchase_price: number;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: {
+          id?: string;
+          variant_id?: string;
+          purchase_price?: number;
+          created_at?: string;
+          updated_at?: string;
+        };
+      };
       inventory_movements: {
+        Relationships: [];
         Row: {
           id: string;
           variant_id: string;
@@ -219,6 +251,7 @@ export interface Database {
         };
       };
       price_history: {
+        Relationships: [];
         Row: {
           id: string;
           variant_id: string;
@@ -232,6 +265,7 @@ export interface Database {
         };
       };
       bills: {
+        Relationships: [];
         Row: {
           id: string;
           supplier_name: string;
@@ -247,6 +281,7 @@ export interface Database {
         };
       };
       keep_alive: {
+        Relationships: [];
         Row: {
           id: number;
           last_ping_at: string;
@@ -265,6 +300,14 @@ export interface Database {
         };
         Returns: Json;
       };
+    };
+
+    Enums: {
+      [_ in never]: never;
+    };
+
+    CompositeTypes: {
+      [_ in never]: never;
     };
   };
 }

@@ -1,12 +1,11 @@
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
-import { ProductItem, INITIAL_PRODUCTS, InventoryMovementRecord } from "@/lib/mock-data";
+import { ProductItem, InventoryMovementRecord } from "@/lib/mock-data";
 
 /**
- * BEGINNER LESSON: Service Layer Pattern
- * Instead of writing database queries inside UI buttons, we put all data fetching
- * and stock logic into this Inventory Service.
- * If Supabase is connected, it uses real cloud PostgreSQL.
- * If credentials are not yet entered, it gracefully falls back so the app never crashes!
+ * BEGINNER LESSON: Hardened Service Layer
+ * In production, we NEVER show fake mock data as real inventory.
+ * If the cloud database is disconnected or returns an error, we report the error honestly
+ * so the showroom staff or owner knows immediately to check their connection.
  */
 
 export interface DbCategory {
@@ -17,20 +16,17 @@ export interface DbCategory {
   icon: string;
 }
 
-export async function fetchShowroomCategories(): Promise<DbCategory[]> {
+export async function fetchShowroomCategories(): Promise<{
+  categories: DbCategory[];
+  error?: string;
+}> {
   const supabase = getSupabaseBrowserClient();
 
   if (!supabase) {
-    // Fallback categories
-    return [
-      { id: "all", name: "All Items", nameHi: "सभी सामान", slug: "all", icon: "🏷️" },
-      { id: "wm", name: "Washing Machines", nameHi: "वॉशिंग मशीन", slug: "washing-machines", icon: "🧺" },
-      { id: "ref", name: "Refrigerators", nameHi: "फ्रिज", slug: "refrigerators", icon: "❄️" },
-      { id: "ac", name: "Air Conditioners", nameHi: "एसी (AC)", slug: "air-conditioners", icon: "💨" },
-      { id: "tv", name: "LED TVs", nameHi: "एलईडी टीवी", slug: "led-tvs", icon: "📺" },
-      { id: "cooler", name: "Air Coolers", nameHi: "कूलर", slug: "air-coolers", icon: "🌀" },
-      { id: "other", name: "Other Electronics", nameHi: "अन्य सामान", slug: "other", icon: "🔌" },
-    ];
+    return {
+      categories: [],
+      error: "Supabase credentials are not configured in .env.local",
+    };
   }
 
   try {
@@ -39,36 +35,40 @@ export async function fetchShowroomCategories(): Promise<DbCategory[]> {
       .select("id, name, name_hi, slug, icon, display_order")
       .order("display_order", { ascending: true });
 
-    if (error || !data || data.length === 0) {
-      console.warn("Could not fetch categories from Supabase, using defaults:", error?.message);
-      return [];
+    if (error) {
+      return { categories: [], error: error.message };
     }
 
-    return data.map((c) => ({
+    const categories = (data || []).map((c) => ({
       id: c.id,
       name: c.name,
       nameHi: c.name_hi,
       slug: c.slug,
       icon: c.icon,
     }));
-  } catch (err) {
-    console.error("Error fetching categories:", err);
-    return [];
+
+    return { categories };
+  } catch (err: any) {
+    return { categories: [], error: err?.message || "Failed to fetch categories" };
   }
 }
 
 /**
  * Fetches all active showroom product variants from Supabase.
- * Each variant is treated as an independent item with its own stock and model number.
+ * NOTE: Sensitive purchase prices are NOT in this table anymore!
+ * They are stored in the private product_costs table.
  */
 export async function fetchShowroomProducts(): Promise<{
   products: ProductItem[];
-  isFromSupabase: boolean;
+  error?: string;
 }> {
   const supabase = getSupabaseBrowserClient();
 
   if (!supabase) {
-    return { products: INITIAL_PRODUCTS, isFromSupabase: false };
+    return {
+      products: [],
+      error: "Supabase connection is not configured in .env.local",
+    };
   }
 
   try {
@@ -101,9 +101,13 @@ export async function fetchShowroomProducts(): Promise<{
       .eq("is_active", true)
       .order("created_at", { ascending: false });
 
-    if (error || !data || data.length === 0) {
-      console.warn("No Supabase products found or error occurred, using seed data:", error?.message);
-      return { products: INITIAL_PRODUCTS, isFromSupabase: false };
+    if (error) {
+      console.error("Supabase fetch error:", error.message);
+      return { products: [], error: error.message };
+    }
+
+    if (!data || data.length === 0) {
+      return { products: [] };
     }
 
     // Transform Supabase rows into UI ProductItem format
@@ -130,17 +134,43 @@ export async function fetchShowroomProducts(): Promise<{
       };
     });
 
-    return { products: transformed, isFromSupabase: true };
-  } catch (err) {
-    console.error("Exception fetching products from Supabase:", err);
-    return { products: INITIAL_PRODUCTS, isFromSupabase: false };
+    return { products: transformed };
+  } catch (err: any) {
+    console.error("Exception in fetchShowroomProducts:", err);
+    return { products: [], error: err?.message || "Failed to load products" };
+  }
+}
+
+/**
+ * Fetches the confidential purchase price for a variant.
+ * Strictly protected by PostgreSQL Row Level Security (RLS).
+ * If caller is not Owner, PostgreSQL returns 0 rows!
+ */
+export async function fetchProductCost(variantId: string): Promise<number | null> {
+  const supabase = getSupabaseBrowserClient();
+  if (!supabase) return null;
+
+  try {
+    const { data, error } = await supabase
+      .from("product_costs")
+      .select("purchase_price")
+      .eq("variant_id", variantId)
+      .single();
+
+    if (error || !data) {
+      // Forbidden or not found
+      return null;
+    }
+
+    return Number(data.purchase_price);
+  } catch {
+    return null;
   }
 }
 
 /**
  * Executes a stock movement atomically on Supabase.
- * Uses the database stored procedure `execute_stock_movement`
- * which enforces stock >= 0 and records the movement history in one transaction.
+ * Requires logged-in Staff or Owner session.
  */
 export async function executeStockChange(params: {
   variantId: string;
@@ -158,8 +188,16 @@ export async function executeStockChange(params: {
   const supabase = getSupabaseBrowserClient();
 
   if (!supabase) {
-    // Local simulation when Supabase credentials are not yet configured
-    return { success: true };
+    return { success: false, error: "Database connection not configured" };
+  }
+
+  // Ensure user is logged in
+  const { data: { session } } = await supabase.auth.getSession();
+  if (!session?.user) {
+    return {
+      success: false,
+      error: "You must be logged in as Staff or Owner to change stock.",
+    };
   }
 
   try {
@@ -194,10 +232,7 @@ export async function executeStockChange(params: {
  */
 export async function fetchMovementHistory(): Promise<InventoryMovementRecord[]> {
   const supabase = getSupabaseBrowserClient();
-
-  if (!supabase) {
-    return [];
-  }
+  if (!supabase) return [];
 
   try {
     const { data, error } = await supabase
@@ -224,7 +259,6 @@ export async function fetchMovementHistory(): Promise<InventoryMovementRecord[]>
       .limit(30);
 
     if (error || !data) {
-      console.warn("Could not fetch movements from Supabase:", error?.message);
       return [];
     }
 

@@ -10,6 +10,14 @@ interface PinModalProps {
   onClose: () => void;
 }
 
+/**
+ * SECURITY ARCHITECTURE NOTE:
+ * This 4-digit PIN is ONLY a fast convenience screen-lock for the showroom floor
+ * (e.g. to prevent customers or kids from accidentally tapping "Sold 1" or editing prices).
+ * It is NOT a real security boundary.
+ * True database security is strictly enforced by Supabase Auth sessions, authenticated JWT tokens,
+ * and PostgreSQL Row Level Security (RLS) policies.
+ */
 export function PinModal({ isOpen, onSuccess, onClose }: PinModalProps) {
   const { t } = useLanguage();
   const [pin, setPin] = useState("");
