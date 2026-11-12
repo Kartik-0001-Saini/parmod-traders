@@ -29,6 +29,7 @@ import { AuthModal } from "@/components/AuthModal";
 import { AddProductModal } from "@/components/AddProductModal";
 import { EditProductModal } from "@/components/EditProductModal";
 import { AdjustStockModal } from "@/components/AdjustStockModal";
+import { HistoryView } from "@/components/HistoryView";
 import { ProductItem, InventoryMovementRecord } from "@/lib/mock-data";
 import { useLanguage } from "@/lib/language-context";
 import { useAuth } from "@/lib/auth-context";
@@ -225,14 +226,17 @@ export default function HomePage() {
     changeType: "sale",
   });
 
-  // Undo Toast State
+  // Undo Toast State (10-Second Window with Database Movement Reference)
   const [lastAction, setLastAction] = useState<{
+    movementId: string;
     product: ProductItem;
     previousStock: number;
     newStock: number;
     type: "sale" | "return";
     timeoutId?: NodeJS.Timeout;
+    intervalId?: NodeJS.Timeout;
   } | null>(null);
+  const [undoSecondsLeft, setUndoSecondsLeft] = useState(10);
 
   // Open "Sold 1" Action
   const handleSellOne = (product: ProductItem) => {
@@ -306,15 +310,27 @@ export default function HomePage() {
     });
 
     if (!result.success) {
-      // If server failed (e.g. stock constraint), revert optimistic state
-      alert(result.error || "Failed to update stock in database.");
+      // Friendly Concurrency Conflict Handling
+      if (
+        result.error?.includes("INSUFFICIENT_STOCK") ||
+        result.error?.includes("Stock cannot go below 0")
+      ) {
+        alert(
+          lang === "hi"
+            ? `⚠️ स्टॉक बदल चुका है!\n\nकिसी और ने अभी-अभी यह आइटम बेच दिया है या स्टॉक खत्म हो चुका है।\nदुकान का कैटलॉग ताज़ा किया जा रहा है...`
+            : `⚠️ Stock conflict!\n\nSomeone else just updated this item, or stock reached 0.\nRefreshing showroom catalog...`
+        );
+      } else {
+        alert(result.error || "Failed to update stock in database.");
+      }
       loadInitialData();
       return;
     }
 
     // 3. Record movement in history
+    const newMovementId = result.movementId || `mov-${Date.now()}`;
     const newMovement: InventoryMovementRecord = {
-      id: result.movementId || `mov-${Date.now()}`,
+      id: newMovementId,
       productId: targetProduct.id,
       productName: targetProduct.name,
       variant: targetProduct.variant,
@@ -329,67 +345,105 @@ export default function HomePage() {
     };
     setMovements((prev) => [newMovement, ...prev]);
 
-    // 4. Setup 5-Second Undo Toast
+    // 4. Setup 10-Second Undo Toast with Timer Countdown
     if (lastAction?.timeoutId) {
       clearTimeout(lastAction.timeoutId);
     }
+    if (lastAction?.intervalId) {
+      clearInterval(lastAction.intervalId);
+    }
+
+    setUndoSecondsLeft(10);
+
+    const intervalId = setInterval(() => {
+      setUndoSecondsLeft((prev) => {
+        if (prev <= 1) {
+          clearInterval(intervalId);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
     const timeoutId = setTimeout(() => {
+      clearInterval(intervalId);
       setLastAction(null);
-    }, 5000);
+    }, 10000);
 
     setLastAction({
+      movementId: newMovementId,
       product: targetProduct,
       previousStock,
       newStock,
       type,
       timeoutId,
+      intervalId,
     });
   };
 
-  // Undo the Last Stock Change
+  // Undo the Last Stock Change (Strictly links to original movement ID)
   const handleUndo = async () => {
     if (!lastAction) return;
 
-    const { product, previousStock } = lastAction;
+    const { movementId, product, previousStock, type } = lastAction;
     const performer = fullName || user?.email || (role === "owner" ? "Owner" : "Showroom Staff");
+    const undoQty = type === "sale" ? 1 : -1;
 
-    // Revert stock locally
+    // Clear timers immediately
+    if (lastAction.timeoutId) clearTimeout(lastAction.timeoutId);
+    if (lastAction.intervalId) clearInterval(lastAction.intervalId);
+    setLastAction(null);
+
+    // 1. Optimistic Revert
     setProducts((prev) =>
       prev.map((item) =>
         item.id === product.id ? { ...item, currentStock: previousStock } : item
       )
     );
 
-    // Sync undo with Supabase
-    await executeStockChange({
+    // 2. Atomic Database Execution with strict original movement linkage
+    const res = await executeStockChange({
       variantId: product.id,
-      changeQty: previousStock - lastAction.newStock,
-      reason: "manual_correction",
+      changeQty: undoQty,
+      reason: "undo",
+      originalMovementId: movementId,
       performedBy: performer,
-      notes: "Undo Last Action",
+      notes: `Undo of ${type === "sale" ? "Sale" : "Customer Return"}`,
     });
 
-    // Record undo movement
-    const undoMovement: InventoryMovementRecord = {
-      id: `mov-undo-${Date.now()}`,
-      productId: product.id,
-      productName: product.name,
-      variant: product.variant,
-      modelNumber: product.modelNumber,
-      type: "correction",
-      quantityChange: previousStock - lastAction.newStock,
-      previousStock: lastAction.newStock,
-      newStock: previousStock,
-      reason: "Undo Last Action",
-      timestamp: new Date().toISOString(),
-      performedBy: performer,
-    };
-    setMovements((prev) => [undoMovement, ...prev]);
+    if (!res.success) {
+      // Friendly Security & Expiry Feedback
+      let friendlyMsg = res.error || "Failed to undo action.";
+      if (res.error?.includes("ALREADY_UNDONE")) {
+        friendlyMsg =
+          lang === "hi"
+            ? "यह सौदा पहले ही अनडू (रद्द) किया जा चुका है।"
+            : "This action has already been undone.";
+      } else if (res.error?.includes("UNDO_EXPIRED")) {
+        friendlyMsg =
+          lang === "hi"
+            ? "10 मिनट की अनडू समय सीमा समाप्त हो चुकी है।"
+            : "The 10-minute undo window has expired.";
+      } else if (res.error?.includes("UNAUTHORIZED_UNDO")) {
+        friendlyMsg =
+          lang === "hi"
+            ? "सुरक्षा नियम: स्टाफ केवल अपने खुद के सौदे अनडू कर सकता है।"
+            : "Security rule: Staff can only undo their own actions.";
+      } else if (res.error?.includes("INSUFFICIENT_STOCK")) {
+        friendlyMsg =
+          lang === "hi"
+            ? "दुकान में स्टॉक 0 से कम नहीं हो सकता!"
+            : "Stock cannot drop below 0!";
+      }
 
-    if (lastAction.timeoutId) {
-      clearTimeout(lastAction.timeoutId);
+      alert(friendlyMsg);
+      loadInitialData();
+      return;
     }
-    setLastAction(null);
+
+    // 3. Refresh Movement History from Database
+    const freshMovements = await fetchMovementHistory();
+    setMovements(freshMovements);
   };
 
   // Quick Action Tile handlers
@@ -616,53 +670,8 @@ export default function HomePage() {
                 </button>
               </div>
             ) : activeTab === "history" ? (
-              /* Tab: Inventory Movements History */
-              <div className="bg-white rounded-3xl p-5 border border-slate-200 shadow-xs flex flex-col gap-3">
-                <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-                  <div className="flex items-center gap-2">
-                    <HistoryIcon className="w-5 h-5 text-emerald-600" />
-                    <h3 className="font-bold text-slate-900 text-base">
-                      {lang === "hi" ? "स्टॉक लेन-देन का इतिहास" : "Stock Movement History"}
-                    </h3>
-                  </div>
-                  <span className="text-xs font-semibold text-slate-500">
-                    {movements.length} {lang === "hi" ? "रिकॉर्ड" : "entries"}
-                  </span>
-                </div>
-
-                {movements.length === 0 ? (
-                  <p className="text-xs text-slate-400 text-center py-8">
-                    {lang === "hi"
-                      ? "अभी तक कोई लेन-देन नहीं हुआ है। सामान बिकने पर '1 बिका' दबाएं।"
-                      : "No stock changes recorded yet. Tap 'Sold 1' on any product to see the audit log."}
-                  </p>
-                ) : (
-                  <div className="flex flex-col divide-y divide-slate-100">
-                    {movements.map((mov) => (
-                      <div key={mov.id} className="py-2.5 flex items-center justify-between text-xs">
-                        <div>
-                          <p className="font-bold text-slate-800">{mov.productName}</p>
-                          <p className="text-slate-400 text-[11px]">
-                            {mov.modelNumber} • {mov.reason} ({mov.performedBy})
-                          </p>
-                        </div>
-                        <div className="text-right">
-                          <span
-                            className={`font-black text-sm ${
-                              mov.quantityChange < 0 ? "text-emerald-600" : "text-blue-600"
-                            }`}
-                          >
-                            {mov.quantityChange > 0 ? `+${mov.quantityChange}` : mov.quantityChange}
-                          </span>
-                          <p className="text-[10px] text-slate-400">
-                            {mov.previousStock} → {mov.newStock}
-                          </p>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
+              /* Tab: Inventory Movements History (Phase 4 Filtered Audit View) */
+              <HistoryView movements={movements} onRefresh={loadInitialData} />
             ) : (
               /* Tab: Home & Catalog Products Grid */
               <div>
@@ -740,20 +749,36 @@ export default function HomePage() {
         )}
       </main>
 
-      {/* Floating 5-Second Undo Toast */}
+      {/* Floating 10-Second Undo Toast */}
       {lastAction && (
-        <div className="fixed bottom-20 sm:bottom-6 left-1/2 -translate-x-1/2 z-50 bg-slate-950 text-white px-4 py-2.5 rounded-2xl shadow-xl flex items-center gap-3 border border-slate-800 animate-in slide-in-from-bottom-5">
-          <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-          <div className="text-xs">
-            <span className="font-bold">{lastAction.product.modelNumber}:</span>{" "}
-            {lastAction.previousStock} → {lastAction.newStock}
+        <div className="fixed bottom-20 sm:bottom-6 left-1/2 -translate-x-1/2 z-50 bg-slate-950 text-white px-4 py-3 rounded-2xl shadow-2xl flex items-center gap-3 border border-slate-800 animate-in slide-in-from-bottom-5 max-w-sm w-full mx-auto">
+          <div className="w-8 h-8 rounded-xl bg-purple-900/60 border border-purple-500/40 text-purple-300 flex items-center justify-center shrink-0">
+            <RotateCcw className="w-4 h-4" />
+          </div>
+          <div className="flex flex-col flex-1 min-w-0">
+            <div className="flex items-center justify-between text-xs font-bold">
+              <span className="truncate">{lastAction.product.modelNumber}</span>
+              <span className="text-[10px] text-purple-300 font-mono bg-purple-950/60 px-1.5 py-0.5 rounded border border-purple-800">
+                {undoSecondsLeft}s
+              </span>
+            </div>
+            <p className="text-[11px] text-slate-400 truncate">
+              {lastAction.type === "sale"
+                ? lang === "hi"
+                  ? "बिक्री दर्ज हुई"
+                  : "Sale recorded"
+                : lang === "hi"
+                ? "वापसी दर्ज हुई"
+                : "Return recorded"}{" "}
+              ({lastAction.previousStock} → {lastAction.newStock})
+            </p>
           </div>
           <button
             onClick={handleUndo}
-            className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-500 hover:bg-emerald-600 text-white font-bold text-xs transition-colors active:scale-95"
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-purple-600 hover:bg-purple-700 text-white font-bold text-xs transition-colors active:scale-95 shrink-0 shadow-xs"
           >
-            <RotateCcw className="w-3 h-3" />
-            <span>{t.undoBtn}</span>
+            <RotateCcw className="w-3.5 h-3.5" />
+            <span>{lang === "hi" ? "अनडू करें" : "Undo"}</span>
           </button>
         </div>
       )}

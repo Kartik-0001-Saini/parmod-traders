@@ -150,11 +150,13 @@ export interface InventoryMovementRecord {
   productName: string;
   variant: string;
   modelNumber: string;
-  type: "sale" | "return" | "add_stock" | "correction";
+  type: "sale" | "return" | "add_stock" | "correction" | "undo";
   quantityChange: number; // -1 for sale, +1 for return
   previousStock: number;
   newStock: number;
   reason: string;
   timestamp: string;
   performedBy: string;
+  isUndone?: boolean;
+  originalMovementId?: string;
 }

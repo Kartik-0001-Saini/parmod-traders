@@ -250,9 +250,10 @@ export function extractDynamicFilterOptions(
 export async function executeStockChange(params: {
   variantId: string;
   changeQty: number; // -1 for sale, +1 for return
-  reason: "sale" | "return" | "manual_correction" | "stock_count";
+  reason: "sale" | "return" | "manual_correction" | "stock_count" | "undo";
   performedBy: string;
   notes?: string;
+  originalMovementId?: string;
 }): Promise<{
   success: boolean;
   newStock?: number;
@@ -282,6 +283,7 @@ export async function executeStockChange(params: {
       p_reason: params.reason,
       p_performed_by: params.performedBy,
       p_notes: params.notes || null,
+      p_original_movement_id: params.originalMovementId || null,
     });
 
     if (error) {
@@ -322,6 +324,8 @@ export async function fetchMovementHistory(): Promise<InventoryMovementRecord[]>
         notes,
         performed_by,
         created_at,
+        is_undone,
+        original_movement_id,
         product_variants (
           variant_name,
           model_number,
@@ -331,7 +335,7 @@ export async function fetchMovementHistory(): Promise<InventoryMovementRecord[]>
         )
       `)
       .order("created_at", { ascending: false })
-      .limit(30);
+      .limit(100);
 
     if (error || !data) {
       return [];
@@ -341,19 +345,27 @@ export async function fetchMovementHistory(): Promise<InventoryMovementRecord[]>
       const variant = m.product_variants || {};
       const prod = variant.products || {};
 
+      let type: "sale" | "return" | "add_stock" | "correction" | "undo" = "correction";
+      if (m.reason === "sale") type = "sale";
+      else if (m.reason === "return") type = "return";
+      else if (m.reason === "undo") type = "undo";
+      else if (m.reason === "stock_count") type = "add_stock";
+
       return {
         id: m.id,
         productId: m.variant_id,
         productName: prod.name || "Showroom Item",
         variant: variant.variant_name || "",
         modelNumber: variant.model_number || "",
-        type: m.reason === "sale" ? "sale" : m.reason === "return" ? "return" : "correction",
+        type,
         quantityChange: m.change_qty,
         previousStock: m.previous_stock,
         newStock: m.new_stock,
         reason: m.notes || m.reason,
         timestamp: m.created_at,
         performedBy: m.performed_by,
+        isUndone: m.is_undone || false,
+        originalMovementId: m.original_movement_id || undefined,
       };
     });
   } catch (err) {

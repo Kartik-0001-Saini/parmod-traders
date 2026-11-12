@@ -42,3 +42,24 @@ export function getDaysAgo(dateString: string): { days: number; labelEn: string;
     };
   }
 }
+
+/**
+ * Formats an ISO date into standard Indian format (e.g. "12 Nov 2026, 02:45 PM")
+ */
+export function formatIndianDateTime(isoString: string): string {
+  if (!isoString) return "";
+  try {
+    const date = new Date(isoString);
+    return new Intl.DateTimeFormat("en-IN", {
+      timeZone: "Asia/Kolkata",
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: true,
+    }).format(date);
+  } catch {
+    return isoString;
+  }
+}

@@ -232,11 +232,14 @@ export interface Database {
           change_qty: number;
           previous_stock: number;
           new_stock: number;
-          reason: "sale" | "return" | "purchase_bill" | "manual_correction" | "stock_count";
+          reason: "sale" | "return" | "purchase_bill" | "manual_correction" | "stock_count" | "undo";
           notes: string | null;
           performed_by: string;
           performed_by_user_id: string | null;
           bill_id: string | null;
+          original_movement_id: string | null;
+          is_undone: boolean;
+          undone_at: string | null;
           created_at: string;
         };
         Insert: {
@@ -245,11 +248,14 @@ export interface Database {
           change_qty: number;
           previous_stock: number;
           new_stock: number;
-          reason: "sale" | "return" | "purchase_bill" | "manual_correction" | "stock_count";
+          reason: "sale" | "return" | "purchase_bill" | "manual_correction" | "stock_count" | "undo";
           notes?: string | null;
           performed_by?: string;
           performed_by_user_id?: string | null;
           bill_id?: string | null;
+          original_movement_id?: string | null;
+          is_undone?: boolean;
+          undone_at?: string | null;
           created_at?: string;
         };
       };
