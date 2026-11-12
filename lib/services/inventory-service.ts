@@ -16,6 +16,12 @@ export interface DbCategory {
   icon: string;
 }
 
+export interface DynamicFilterOptions {
+  brands: string[];
+  categories: { slug: string; nameEn: string; nameHi: string; icon: string }[];
+  specsByKey: Record<string, string[]>;
+}
+
 export async function fetchShowroomCategories(): Promise<{
   categories: DbCategory[];
   error?: string;
@@ -54,8 +60,8 @@ export async function fetchShowroomCategories(): Promise<{
 }
 
 /**
- * Fetches all active showroom product variants from Supabase.
- * NOTE: Sensitive purchase prices are NOT in this table anymore!
+ * Fetches all active showroom product variants from Supabase in ONE single optimized query.
+ * NOTE: Sensitive purchase prices are NOT in this table!
  * They are stored in the private product_costs table.
  */
 export async function fetchShowroomProducts(): Promise<{
@@ -78,6 +84,7 @@ export async function fetchShowroomProducts(): Promise<{
         id,
         variant_name,
         model_number,
+        hsn_code,
         attributes,
         current_stock,
         low_stock_threshold,
@@ -92,9 +99,11 @@ export async function fetchShowroomProducts(): Promise<{
           name,
           image_url,
           categories (
+            id,
             name,
             name_hi,
-            slug
+            slug,
+            icon
           )
         )
       `)
@@ -124,6 +133,7 @@ export async function fetchShowroomProducts(): Promise<{
         categoryNameHi: cat.name_hi || "इलेक्ट्रॉनिक्स",
         variant: item.variant_name,
         modelNumber: item.model_number,
+        hsnCode: item.hsn_code || "8450",
         currentStock: item.current_stock,
         lowStockThreshold: item.low_stock_threshold || 2,
         sellingPrice: Number(item.selling_price),
@@ -142,30 +152,95 @@ export async function fetchShowroomProducts(): Promise<{
 }
 
 /**
- * Fetches the confidential purchase price for a variant.
- * Strictly protected by PostgreSQL Row Level Security (RLS).
- * If caller is not Owner, PostgreSQL returns 0 rows!
+ * Fetches all purchase prices from the private product_costs table as a Map.
+ * SECURITY: If the caller is not logged in as Owner, PostgreSQL RLS returns 0 rows!
+ * Result: Staff and public payloads receive an empty object {} (Zero-Knowledge).
  */
-export async function fetchProductCost(variantId: string): Promise<number | null> {
+export async function fetchOwnerCostMap(): Promise<Record<string, number>> {
   const supabase = getSupabaseBrowserClient();
-  if (!supabase) return null;
+  if (!supabase) return {};
 
   try {
     const { data, error } = await supabase
       .from("product_costs")
-      .select("purchase_price")
-      .eq("variant_id", variantId)
-      .single();
+      .select("variant_id, purchase_price");
 
     if (error || !data) {
-      // Forbidden or not found
-      return null;
+      return {};
     }
 
-    return Number(data.purchase_price);
+    const costMap: Record<string, number> = {};
+    for (const row of data) {
+      costMap[row.variant_id] = Number(row.purchase_price);
+    }
+    return costMap;
   } catch {
-    return null;
+    return {};
   }
+}
+
+/**
+ * Dynamically extracts all distinct brands and specs from the currently loaded products.
+ * No hardcoding! If a new brand or attribute is inserted in Supabase,
+ * it immediately appears as an interactive filter chip.
+ */
+export function extractDynamicFilterOptions(
+  products: ProductItem[],
+  categoriesFromDb: DbCategory[] = []
+): DynamicFilterOptions {
+  const brandSet = new Set<string>();
+  const categoryMap = new Map<string, { slug: string; nameEn: string; nameHi: string; icon: string }>();
+  const specsMap: Record<string, Set<string>> = {};
+
+  // First populate categories from DB
+  for (const cat of categoriesFromDb) {
+    categoryMap.set(cat.slug, {
+      slug: cat.slug,
+      nameEn: cat.name,
+      nameHi: cat.nameHi,
+      icon: cat.icon,
+    });
+  }
+
+  for (const p of products) {
+    if (p.brand) {
+      brandSet.add(p.brand.trim());
+    }
+
+    if (p.category && !categoryMap.has(p.category)) {
+      categoryMap.set(p.category, {
+        slug: p.category,
+        nameEn: p.categoryNameEn || p.category,
+        nameHi: p.categoryNameHi || p.category,
+        icon: "🏷️",
+      });
+    }
+
+    // Extract specs (Capacity, Star Rating, Tonnage, Screen Size, Type, etc.)
+    if (p.specifications && typeof p.specifications === "object") {
+      for (const [key, val] of Object.entries(p.specifications)) {
+        if (!val || typeof val !== "string") continue;
+        const cleanKey = key.trim();
+        const cleanVal = val.trim();
+        if (!specsMap[cleanKey]) {
+          specsMap[cleanKey] = new Set<string>();
+        }
+        specsMap[cleanKey].add(cleanVal);
+      }
+    }
+  }
+
+  // Convert Sets to sorted Arrays
+  const specsByKey: Record<string, string[]> = {};
+  for (const [k, vSet] of Object.entries(specsMap)) {
+    specsByKey[k] = Array.from(vSet).sort();
+  }
+
+  return {
+    brands: Array.from(brandSet).sort(),
+    categories: Array.from(categoryMap.values()),
+    specsByKey,
+  };
 }
 
 /**
@@ -284,5 +359,161 @@ export async function fetchMovementHistory(): Promise<InventoryMovementRecord[]>
   } catch (err) {
     console.error("Exception fetching movement history:", err);
     return [];
+  }
+}
+
+/**
+ * Checks if a model number already exists in product_variants (case-insensitive).
+ * Useful for live duplicate detection in the Add Product form.
+ */
+export async function checkModelNumberExists(modelNumber: string): Promise<{
+  exists: boolean;
+  variantName?: string;
+  variantId?: string;
+  error?: string;
+}> {
+  const clean = modelNumber.trim();
+  if (!clean) return { exists: false };
+
+  const supabase = getSupabaseBrowserClient();
+  if (!supabase) return { exists: false };
+
+  try {
+    const { data, error } = await supabase
+      .from("product_variants")
+      .select("id, variant_name, model_number")
+      .ilike("model_number", clean)
+      .limit(1);
+
+    if (error) {
+      return { exists: false, error: error.message };
+    }
+
+    if (data && data.length > 0) {
+      return {
+        exists: true,
+        variantId: data[0].id,
+        variantName: data[0].variant_name,
+      };
+    }
+
+    return { exists: false };
+  } catch (err: any) {
+    return { exists: false, error: err?.message };
+  }
+}
+
+export interface CreateProductParams {
+  categoryId: string;
+  brand: string;
+  name: string;
+  variantName: string;
+  modelNumber: string;
+  hsnCode: string;
+  attributes?: Record<string, string>;
+  mrp: number;
+  sellingPrice: number;
+  purchasePrice?: number | null;
+  openingStock: number;
+  lowStockThreshold?: number;
+}
+
+/**
+ * Creates a new product variant and saves the purchase price directly
+ * into the private product_costs table (Owner only RPC).
+ */
+export async function createProductWithVariant(
+  params: CreateProductParams
+): Promise<{
+  success: boolean;
+  variantId?: string;
+  error?: string;
+}> {
+  const supabase = getSupabaseBrowserClient();
+  if (!supabase) {
+    return { success: false, error: "Database not connected" };
+  }
+
+  try {
+    const { data, error } = await supabase.rpc("create_product_with_variant_and_cost", {
+      p_category_id: params.categoryId,
+      p_brand: params.brand.trim(),
+      p_name: params.name.trim(),
+      p_variant_name: params.variantName.trim(),
+      p_model_number: params.modelNumber.trim(),
+      p_hsn_code: params.hsnCode.trim(),
+      p_attributes: params.attributes || {},
+      p_mrp: params.mrp,
+      p_selling_price: params.sellingPrice,
+      p_purchase_price: params.purchasePrice ?? null,
+      p_opening_stock: params.openingStock || 0,
+      p_low_stock_threshold: params.lowStockThreshold || 2,
+    });
+
+    if (error) {
+      console.error("RPC create_product_with_variant_and_cost error:", error.message);
+      return { success: false, error: error.message };
+    }
+
+    const res = data as any;
+    return {
+      success: true,
+      variantId: res?.variant_id,
+    };
+  } catch (err: any) {
+    console.error("Exception in createProductWithVariant:", err);
+    return { success: false, error: err?.message || "Failed to create product" };
+  }
+}
+
+export interface UpdateProductParams {
+  variantId: string;
+  modelNumber: string;
+  variantName: string;
+  hsnCode: string;
+  attributes?: Record<string, string>;
+  sellingPrice: number;
+  mrp: number;
+  purchasePrice?: number | null;
+  lowStockThreshold?: number;
+}
+
+/**
+ * Updates an existing product variant and updates the purchase price
+ * in the private product_costs table (Owner only RPC).
+ */
+export async function updateProductVariantDetails(
+  params: UpdateProductParams
+): Promise<{
+  success: boolean;
+  error?: string;
+}> {
+  const supabase = getSupabaseBrowserClient();
+  if (!supabase) {
+    return { success: false, error: "Database not connected" };
+  }
+
+  try {
+    const { data, error } = await supabase.rpc("update_product_variant_details", {
+      p_variant_id: params.variantId,
+      p_variant_name: params.variantName.trim(),
+      p_model_number: params.modelNumber.trim(),
+      p_hsn_code: params.hsnCode.trim(),
+      p_attributes: params.attributes || {},
+      p_selling_price: params.sellingPrice,
+      p_mrp: params.mrp,
+      p_purchase_price: params.purchasePrice ?? null,
+      p_low_stock_threshold: params.lowStockThreshold ?? 2,
+    });
+
+    if (error) {
+      console.error("RPC update_product_variant_details error:", error.message);
+      return { success: false, error: error.message };
+    }
+
+    return { success: true };
+  } catch (err: any) {
+    console.error("Exception in updateProductVariantDetails:", err);
+    return { success: false, error: err?.message || "Failed to update product details" };
   }
 }

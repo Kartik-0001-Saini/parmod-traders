@@ -150,6 +150,7 @@ export interface Database {
           product_id: string;
           variant_name: string;
           model_number: string;
+          hsn_code: string;
           barcode: string | null;
           attributes: Record<string, string>;
           current_stock: number;
@@ -167,6 +168,7 @@ export interface Database {
           product_id: string;
           variant_name: string;
           model_number: string;
+          hsn_code?: string;
           barcode?: string | null;
           attributes?: Record<string, string>;
           current_stock?: number;
@@ -184,6 +186,7 @@ export interface Database {
           product_id?: string;
           variant_name?: string;
           model_number?: string;
+          hsn_code?: string;
           barcode?: string | null;
           attributes?: Record<string, string>;
           current_stock?: number;

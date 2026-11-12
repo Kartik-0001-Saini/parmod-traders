@@ -7,6 +7,7 @@ export interface ProductItem {
   categoryNameHi: string;
   variant: string; // e.g., "8 KG Fully Automatic / Inverter"
   modelNumber: string; // e.g., "WTEON-800-AD" (crucial for electronics showrooms)
+  hsnCode: string; // e.g., "8450" (tax category code)
   currentStock: number;
   lowStockThreshold: number; // Configurable per product (e.g. 2)
   sellingPrice: number; // e.g. 24990
@@ -26,6 +27,7 @@ export const INITIAL_PRODUCTS: ProductItem[] = [
     categoryNameHi: "वॉशिंग मशीन",
     variant: "8 KG Front Load / 5 Star Inverter",
     modelNumber: "WTEON-800-AD",
+    hsnCode: "8450",
     currentStock: 4,
     lowStockThreshold: 2,
     sellingPrice: 28990,
@@ -46,6 +48,7 @@ export const INITIAL_PRODUCTS: ProductItem[] = [
     categoryNameHi: "फ्रिज",
     variant: "260 Litres Smart Inverter / Shiny Steel",
     modelNumber: "GL-S292RDSY",
+    hsnCode: "8418",
     currentStock: 2, // Low stock!
     lowStockThreshold: 2,
     sellingPrice: 26490,
@@ -66,6 +69,7 @@ export const INITIAL_PRODUCTS: ProductItem[] = [
     categoryNameHi: "एसी (AC)",
     variant: "1.5 Ton 3 Star Copper Condenser",
     modelNumber: "183V-Vectra-Plat",
+    hsnCode: "8415",
     currentStock: 0, // Out of stock!
     lowStockThreshold: 1,
     sellingPrice: 32990,
@@ -86,6 +90,7 @@ export const INITIAL_PRODUCTS: ProductItem[] = [
     categoryNameHi: "एलईडी टीवी",
     variant: "55 Inch Ultra HD (4K) Smart LED",
     modelNumber: "UA55AUE60AKXXL",
+    hsnCode: "8528",
     currentStock: 6,
     lowStockThreshold: 2,
     sellingPrice: 42990,
@@ -106,6 +111,7 @@ export const INITIAL_PRODUCTS: ProductItem[] = [
     categoryNameHi: "कूलर",
     variant: "35 Litre Personal Tower Cooler with i-Pure",
     modelNumber: "DIET-3D-30i",
+    hsnCode: "8479",
     currentStock: 5,
     lowStockThreshold: 2,
     sellingPrice: 8490,
@@ -125,6 +131,7 @@ export const INITIAL_PRODUCTS: ProductItem[] = [
     categoryNameHi: "अन्य सामान",
     variant: "500 Watt with 3 Stainless Steel Jars",
     modelNumber: "GX-1-POPLR",
+    hsnCode: "8509",
     currentStock: 1, // Low stock
     lowStockThreshold: 2,
     sellingPrice: 1999,

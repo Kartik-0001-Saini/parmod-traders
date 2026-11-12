@@ -12,35 +12,50 @@ import {
   Database,
   WifiOff,
   RefreshCw,
+  PackagePlus,
 } from "lucide-react";
 import { Header } from "@/components/Header";
 import { BottomNav, NavTab } from "@/components/BottomNav";
 import { ActionTiles } from "@/components/ActionTiles";
-import { CategoryBar, CategoryFilter } from "@/components/CategoryBar";
+import {
+  DynamicFilters,
+  ActiveFilters,
+} from "@/components/DynamicFilters";
 import { ProductCard } from "@/components/ProductCard";
+import { ProductCardSkeleton } from "@/components/ProductCardSkeleton";
 import { SaleConfirmDialog } from "@/components/SaleConfirmDialog";
 import { PinModal } from "@/components/PinModal";
 import { AuthModal } from "@/components/AuthModal";
+import { AddProductModal } from "@/components/AddProductModal";
+import { EditProductModal } from "@/components/EditProductModal";
+import { AdjustStockModal } from "@/components/AdjustStockModal";
 import { ProductItem, InventoryMovementRecord } from "@/lib/mock-data";
 import { useLanguage } from "@/lib/language-context";
 import { useAuth } from "@/lib/auth-context";
+import { searchProducts } from "@/lib/search-engine";
+import { getDaysAgo } from "@/lib/utils";
+import { groupAndSortProducts, SortOption } from "@/lib/sort-engine";
 import {
   fetchShowroomProducts,
+  fetchShowroomCategories,
+  fetchOwnerCostMap,
+  extractDynamicFilterOptions,
   executeStockChange,
   fetchMovementHistory,
+  DbCategory,
 } from "@/lib/services/inventory-service";
 
 /**
- * BEGINNER LESSON: Production-Hardened Page
- * 1. Real Supabase Authentication: We read active role ('owner' | 'staff') from useAuth().
- * 2. Fail-Closed Reliability: If the database is unreachable, we show a clean friendly error,
- *    never fake/dummy data.
- * 3. 4-Digit PIN: Kept purely as a quick screen-lock against accidental taps on the showroom phone.
+ * BEGINNER LESSON: Phase 3 Check Mode
+ * 1. 5-Second Search: searchProducts() uses token normalization and typo tolerance
+ * 2. Dynamic DB Filters: extractDynamicFilterOptions() pulls live brands and specs from PostgreSQL
+ * 3. Zero-Knowledge Costs: fetchOwnerCostMap() executes ONLY if user is Owner (RLS protected)
+ * 4. Skeleton Screen: ProductCardSkeleton renders instant card outlines while loading
  */
 
 export default function HomePage() {
   const { lang, t } = useLanguage();
-  const { isAuthenticated, role, fullName, user } = useAuth();
+  const { isAuthenticated, role, fullName, user, isOwner } = useAuth();
 
   // App Mode State: "check" (default, read-only showroom mode) or "update" (owner mode)
   const [mode, setMode] = useState<"check" | "update">("check");
@@ -50,25 +65,54 @@ export default function HomePage() {
   // Active Navigation Tab
   const [activeTab, setActiveTab] = useState<NavTab>("home");
 
-  // Search & Category Filter
+  // Search Query
   const [searchQuery, setSearchQuery] = useState("");
-  const [selectedCategory, setSelectedCategory] = useState<CategoryFilter>("all");
   const searchInputRef = useRef<HTMLInputElement>(null);
+
+  // Dynamic Filters State
+  const [activeFilters, setActiveFilters] = useState<ActiveFilters>({
+    category: "all",
+    brand: "all",
+    specKey: null,
+    specValue: null,
+    stockStatus: "all",
+  });
+
+  // Sorting & Grouping Option
+  const [sortOption, setSortOption] = useState<SortOption>("size_desc");
+
+  // Owner Management Modals State
+  const [isAddProductModalOpen, setIsAddProductModalOpen] = useState(false);
+  const [editProductState, setEditProductState] = useState<{
+    isOpen: boolean;
+    product: ProductItem | null;
+  }>({ isOpen: false, product: null });
+  const [adjustStockState, setAdjustStockState] = useState<{
+    isOpen: boolean;
+    product: ProductItem | null;
+  }>({ isOpen: false, product: null });
 
   // Live Inventory State: Starts empty, populated strictly from real Supabase DB
   const [products, setProducts] = useState<ProductItem[]>([]);
+  const [categories, setCategories] = useState<DbCategory[]>([]);
+  const [ownerCostMap, setOwnerCostMap] = useState<Record<string, number>>({});
   const [isLoading, setIsLoading] = useState(true);
   const [dbError, setDbError] = useState<string | null>(null);
 
   // Inventory Movements History Log
   const [movements, setMovements] = useState<InventoryMovementRecord[]>([]);
 
-  // Function to load live showroom data from Supabase
+  // Function to load live showroom data from Supabase in ONE single request batch
   const loadInitialData = async () => {
     setIsLoading(true);
     setDbError(null);
     try {
-      const prodResult = await fetchShowroomProducts();
+      const [prodResult, catResult, histResult] = await Promise.all([
+        fetchShowroomProducts(),
+        fetchShowroomCategories(),
+        fetchMovementHistory(),
+      ]);
+
       if (prodResult.error) {
         setDbError(prodResult.error);
         setProducts([]);
@@ -76,8 +120,8 @@ export default function HomePage() {
         setProducts(prodResult.products);
       }
 
-      const histResult = await fetchMovementHistory();
-      setMovements(histResult);
+      setCategories(catResult.categories || []);
+      setMovements(histResult || []);
     } catch (err: any) {
       console.error("Database loading exception:", err);
       setDbError(err?.message || "Failed to connect to shop database.");
@@ -90,6 +134,85 @@ export default function HomePage() {
   useEffect(() => {
     loadInitialData();
   }, []);
+
+  // Fetch Owner Purchase Costs securely ONLY when user is authenticated as Owner
+  useEffect(() => {
+    if (isOwner) {
+      fetchOwnerCostMap().then((costs) => {
+        setOwnerCostMap(costs);
+      });
+    } else {
+      // Clear all cost memory if logged out or Staff
+      setOwnerCostMap({});
+    }
+  }, [isOwner]);
+
+  // Extract dynamic filter options directly from the database catalog
+  const dynamicFilterOptions = useMemo(() => {
+    return extractDynamicFilterOptions(products, categories);
+  }, [products, categories]);
+
+  // Reset all filters helper
+  const handleResetFilters = () => {
+    setActiveFilters({
+      category: "all",
+      brand: "all",
+      specKey: null,
+      specValue: null,
+      stockStatus: "all",
+    });
+    setSearchQuery("");
+  };
+
+  // Filter & Search Pipeline
+  const filteredProducts = useMemo(() => {
+    // Step 1: Filter by Category, Brand, Specs, and Stock Status
+    const baseFiltered = products.filter((item) => {
+      // Category Filter
+      if (activeFilters.category !== "all" && item.category !== activeFilters.category) {
+        return false;
+      }
+
+      // Brand Filter
+      if (activeFilters.brand !== "all" && item.brand.toLowerCase() !== activeFilters.brand.toLowerCase()) {
+        return false;
+      }
+
+      // Spec / Attribute Filter (e.g. Capacity = '8 KG')
+      if (activeFilters.specKey && activeFilters.specValue) {
+        const itemVal = item.specifications?.[activeFilters.specKey];
+        if (!itemVal || itemVal.toLowerCase() !== activeFilters.specValue.toLowerCase()) {
+          return false;
+        }
+      }
+
+      // Stock Status Filter
+      if (activeFilters.stockStatus === "in_stock") {
+        if (item.currentStock <= item.lowStockThreshold) return false;
+      } else if (activeFilters.stockStatus === "low_stock") {
+        if (item.currentStock <= 0 || item.currentStock > item.lowStockThreshold) return false;
+      } else if (activeFilters.stockStatus === "out_of_stock") {
+        if (item.currentStock > 0) return false;
+      } else if (activeFilters.stockStatus === "needs_verification") {
+        const days = getDaysAgo(item.lastVerifiedDate).days;
+        if (days < 7) return false;
+      }
+
+      return true;
+    });
+
+    // Step 2: Apply Smart 5-Second Typo-Tolerant Search
+    if (!searchQuery.trim()) {
+      return baseFiltered;
+    }
+
+    return searchProducts(baseFiltered, searchQuery);
+  }, [products, activeFilters, searchQuery]);
+
+  // Step 3: Group by HSN Tax Code and Sort inside each group according to showroom rules
+  const hsnGroups = useMemo(() => {
+    return groupAndSortProducts(filteredProducts, sortOption);
+  }, [filteredProducts, sortOption]);
 
   // Confirmation Dialog State
   const [dialogState, setDialogState] = useState<{
@@ -110,26 +233,6 @@ export default function HomePage() {
     type: "sale" | "return";
     timeoutId?: NodeJS.Timeout;
   } | null>(null);
-
-  // Filtered Products based on Search Query and Category
-  const filteredProducts = useMemo(() => {
-    return products.filter((item) => {
-      // Category filter match
-      const matchesCategory =
-        selectedCategory === "all" || item.category === selectedCategory;
-
-      // Search match: matches brand, name, variant, or model number
-      const q = searchQuery.toLowerCase().trim();
-      const matchesSearch =
-        !q ||
-        item.name.toLowerCase().includes(q) ||
-        item.brand.toLowerCase().includes(q) ||
-        item.variant.toLowerCase().includes(q) ||
-        item.modelNumber.toLowerCase().includes(q);
-
-      return matchesCategory && matchesSearch;
-    });
-  }, [products, searchQuery, selectedCategory]);
 
   // Open "Sold 1" Action
   const handleSellOne = (product: ProductItem) => {
@@ -304,11 +407,15 @@ export default function HomePage() {
       setIsAuthModalOpen(true);
       return;
     }
-    if (mode !== "update") {
-      setIsPinModalOpen(true);
-    } else {
-      setActiveTab("catalog");
+    setAdjustStockState({ isOpen: true, product: null });
+  };
+
+  const handleOpenAddProduct = () => {
+    if (!isAuthenticated || role !== "owner") {
+      setIsAuthModalOpen(true);
+      return;
     }
+    setIsAddProductModalOpen(true);
   };
 
   const handleActionUploadBillClick = () => {
@@ -334,7 +441,7 @@ export default function HomePage() {
         onOpenAuthModal={() => setIsAuthModalOpen(true)}
       />
 
-      <main className="max-w-5xl mx-auto px-4 pt-4 flex flex-col gap-4">
+      <main className="max-w-5xl mx-auto px-4 pt-4 flex flex-col gap-3.5">
         {/* Notice Bar: Displays Active Authentication Status & Role */}
         <div
           className={`flex items-center justify-between px-3.5 py-2.5 rounded-2xl text-xs font-medium border flex-wrap gap-2 shadow-2xs ${
@@ -351,13 +458,13 @@ export default function HomePage() {
               {isAuthenticated
                 ? role === "owner"
                   ? lang === "hi"
-                    ? `मालिक खाता: ${fullName || user?.email} (सभी अधिकार उपलब्ध)`
-                    : `Owner Account: ${fullName || user?.email} (Full privileges)`
+                    ? `मालिक खाता: ${fullName || user?.email} (खरीद रेट व सभी अधिकार उपलब्ध)`
+                    : `Owner Account: ${fullName || user?.email} (Costs & Full privileges)`
                   : lang === "hi"
                   ? `स्टाफ खाता: ${fullName || user?.email} (बिक्री/वापसी की अनुमति)`
                   : `Staff Account: ${fullName || user?.email} (Sales allowed)`
                 : lang === "hi"
-                ? "देखने का मोड: कोई भी रेट व स्टॉक देख सकता है। बदलाव के लिए लॉगिन करें।"
+                ? "देखने का मोड: कोई भी रेट व स्टॉक देख सकता है। बिक्री दर्ज करने के लिए लॉगिन करें।"
                 : "Check Mode: Public showroom view. Log in to record sales."}
             </span>
           </div>
@@ -420,7 +527,7 @@ export default function HomePage() {
           </div>
         ) : (
           <>
-            {/* 2. Big Blinkit-Style Search Bar */}
+            {/* 2. Big Blinkit-Style Search Bar (Under 5 seconds showroom lookup) */}
             <div className="relative">
               <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-400">
                 <Search className="w-5 h-5" />
@@ -430,7 +537,7 @@ export default function HomePage() {
                 type="text"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder={t.searchPlaceholder}
+                placeholder={lang === "hi" ? "सामान, ब्रांड, मॉडल या क्षमता खोजें (जैसे Godrej 8kg)..." : "Search brand, model or size (e.g. Godrej 8kg, Voltas 1.5)..."}
                 className="w-full pl-10 pr-10 py-3.5 rounded-2xl bg-white border border-slate-200/90 text-sm font-medium text-slate-900 placeholder-slate-400 focus:outline-hidden focus:ring-2 focus:ring-emerald-500 focus:border-transparent shadow-xs transition-all"
               />
               {searchQuery && (
@@ -453,30 +560,40 @@ export default function HomePage() {
               />
             )}
 
-            {/* 4. Category Filter Bar */}
-            <div className="pt-1">
-              <div className="flex items-center justify-between mb-1.5 px-0.5">
-                <h2 className="text-xs font-bold uppercase tracking-wider text-slate-500">
-                  {lang === "hi" ? "कैटेगरी चुनें" : "Categories"}
-                </h2>
-                <span className="text-[11px] font-semibold text-slate-400">
-                  {filteredProducts.length} {t.showingItems}
-                </span>
+            {/* 4. Dynamic Database Filters (Categories, Brands, Specs, Stock Status) */}
+            <DynamicFilters
+              filterOptions={dynamicFilterOptions}
+              activeFilters={activeFilters}
+              onChangeFilters={setActiveFilters}
+              onResetFilters={handleResetFilters}
+              totalFilteredCount={filteredProducts.length}
+              sortOption={sortOption}
+              onChangeSortOption={setSortOption}
+            />
+
+            {/* Owner Add Product Button Banner */}
+            {isOwner && (
+              <div className="flex items-center justify-between bg-amber-500/10 border border-amber-300/80 px-4 py-2.5 rounded-2xl">
+                <div className="flex items-center gap-2">
+                  <PackagePlus className="w-4 h-4 text-amber-700" />
+                  <span className="text-xs font-bold text-amber-950">
+                    {lang === "hi" ? "दुकान में नया सामान जोड़ना है?" : "Want to add a new product model?"}
+                  </span>
+                </div>
+                <button
+                  onClick={handleOpenAddProduct}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs shadow-xs active:scale-95 transition-all"
+                >
+                  <PackagePlus className="w-3.5 h-3.5" />
+                  <span>{lang === "hi" ? "+ नया सामान जोड़ें" : "+ Add Product"}</span>
+                </button>
               </div>
-              <CategoryBar
-                selectedCategory={selectedCategory}
-                onSelectCategory={setSelectedCategory}
-              />
-            </div>
+            )}
 
             {/* 5. Main Content Switching based on Tab */}
             {isLoading ? (
-              <div className="bg-white rounded-3xl p-12 border border-slate-200 text-center flex flex-col items-center gap-3">
-                <RefreshCw className="w-8 h-8 text-emerald-600 animate-spin" />
-                <p className="text-sm font-bold text-slate-700">
-                  {lang === "hi" ? "दुकान का सामान लोड हो रहा है..." : "Loading showroom inventory..."}
-                </p>
-              </div>
+              /* Instant Skeleton Loader UI (Zero Layout Shift) */
+              <ProductCardSkeleton count={6} />
             ) : activeTab === "bills" ? (
               /* Tab: Scan Bill Preview for Phase 6 */
               <div className="bg-white rounded-3xl p-6 border border-slate-200 text-center flex flex-col items-center gap-3 shadow-xs">
@@ -557,29 +674,63 @@ export default function HomePage() {
                     </h3>
                     <p className="text-xs text-slate-400 max-w-xs">
                       {lang === "hi"
-                        ? "कृपया स्पेलिंग चेक करें या दूसरी कैटेगरी चुनें।"
-                        : "Try checking the spelling or switch category to find what you need."}
+                        ? "कृपया स्पेलिंग चेक करें या फ़िल्टर रीसेट करें।"
+                        : "Try checking your spelling or clear some active filters."}
                     </p>
                     <button
-                      onClick={() => {
-                        setSearchQuery("");
-                        setSelectedCategory("all");
-                      }}
+                      onClick={handleResetFilters}
                       className="px-4 py-2 rounded-xl bg-emerald-50 text-emerald-700 text-xs font-bold hover:bg-emerald-100"
                     >
-                      {lang === "hi" ? "सभी सामान देखें" : "View All Products"}
+                      {lang === "hi" ? "सभी फ़िल्टर हटाएं" : "Clear All Filters"}
                     </button>
                   </div>
                 ) : (
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3.5">
-                    {filteredProducts.map((product) => (
-                      <ProductCard
-                        key={product.id}
-                        product={product}
-                        mode={mode}
-                        onSellOne={handleSellOne}
-                        onReturnOne={handleReturnOne}
-                      />
+                  <div className="flex flex-col gap-5">
+                    {hsnGroups.map((group) => (
+                      <div key={group.hsnCode} className="flex flex-col gap-2.5">
+                        {/* HSN Group Header Banner */}
+                        <div className="flex items-center justify-between bg-white px-3.5 py-2 rounded-2xl border border-slate-200/90 shadow-2xs">
+                          <div className="flex items-center gap-2">
+                            <span className="font-mono text-xs font-black bg-slate-900 text-white px-2 py-0.5 rounded-md">
+                              HSN: {group.hsnCode}
+                            </span>
+                            <span className="text-xs font-bold text-slate-800">
+                              {group.items[0]?.categoryNameEn || "Showroom Category"} • {group.items.length}{" "}
+                              {lang === "hi" ? "मॉडल" : "models"}
+                            </span>
+                          </div>
+                          <span className="text-[10px] font-semibold text-slate-400">
+                            {sortOption.startsWith("size")
+                              ? lang === "hi"
+                                ? "साइज अनुसार"
+                                : "Sorted by Size"
+                              : sortOption.startsWith("price")
+                              ? lang === "hi"
+                                ? "रेट अनुसार"
+                                : "Sorted by Price"
+                              : lang === "hi"
+                              ? "ब्रांड अनुसार"
+                              : "Sorted by Brand"}
+                          </span>
+                        </div>
+
+                        {/* Product Cards Grid */}
+                        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3.5">
+                          {group.items.map((product) => (
+                            <ProductCard
+                              key={product.id}
+                              product={product}
+                              mode={mode}
+                              onSellOne={handleSellOne}
+                              onReturnOne={handleReturnOne}
+                              onEditProduct={(p) => setEditProductState({ isOpen: true, product: p })}
+                              onAdjustStock={(p) => setAdjustStockState({ isOpen: true, product: p })}
+                              isOwner={isOwner}
+                              ownerPurchasePrice={ownerCostMap[product.id]}
+                            />
+                          ))}
+                        </div>
+                      </div>
                     ))}
                   </div>
                 )}
@@ -632,6 +783,52 @@ export default function HomePage() {
       <AuthModal
         isOpen={isAuthModalOpen}
         onClose={() => setIsAuthModalOpen(false)}
+      />
+
+      {/* Owner Add Product Modal */}
+      <AddProductModal
+        isOpen={isAddProductModalOpen}
+        onClose={() => setIsAddProductModalOpen(false)}
+        categories={categories}
+        existingBrands={dynamicFilterOptions.brands}
+        onProductCreated={() => {
+          loadInitialData();
+          if (isOwner) {
+            fetchOwnerCostMap().then(setOwnerCostMap);
+          }
+        }}
+        onSwitchToAdjustStock={(modelNum) => {
+          const match = products.find(
+            (p) => p.modelNumber.toLowerCase() === modelNum.toLowerCase()
+          );
+          setAdjustStockState({ isOpen: true, product: match || null });
+        }}
+      />
+
+      {/* Owner Edit Product Modal */}
+      <EditProductModal
+        isOpen={editProductState.isOpen}
+        onClose={() => setEditProductState({ isOpen: false, product: null })}
+        product={editProductState.product}
+        currentCost={editProductState.product ? ownerCostMap[editProductState.product.id] : null}
+        onProductUpdated={() => {
+          loadInitialData();
+          if (isOwner) {
+            fetchOwnerCostMap().then(setOwnerCostMap);
+          }
+        }}
+      />
+
+      {/* Adjust Stock Modal (Add units from Delivery / Corrections) */}
+      <AdjustStockModal
+        isOpen={adjustStockState.isOpen}
+        onClose={() => setAdjustStockState({ isOpen: false, product: null })}
+        products={products}
+        initialProduct={adjustStockState.product}
+        onStockAdjusted={() => {
+          loadInitialData();
+        }}
+        performedBy={fullName || user?.email || (role === "owner" ? "Owner" : "Showroom Staff")}
       />
 
       {/* Mobile Bottom Navigation */}
