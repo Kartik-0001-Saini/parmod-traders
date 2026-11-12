@@ -517,3 +517,43 @@ export async function updateProductVariantDetails(
     return { success: false, error: err?.message || "Failed to update product details" };
   }
 }
+
+export interface KeepAliveStatus {
+  lastPingAt: string | null;
+  pingSource: string | null;
+  error?: string;
+}
+
+/**
+ * Fetches the most recent keep-alive ping timestamp from Supabase.
+ * Useful for Owner Dashboard health status checks.
+ */
+export async function fetchLastKeepAliveTime(): Promise<KeepAliveStatus> {
+  const supabase = getSupabaseBrowserClient();
+  if (!supabase) {
+    return { lastPingAt: null, pingSource: null, error: "Database not connected" };
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from("keep_alive")
+      .select("last_ping_at, ping_source")
+      .order("last_ping_at", { ascending: false })
+      .limit(1);
+
+    if (error) {
+      return { lastPingAt: null, pingSource: null, error: error.message };
+    }
+
+    if (data && data.length > 0) {
+      return {
+        lastPingAt: data[0].last_ping_at,
+        pingSource: data[0].ping_source,
+      };
+    }
+
+    return { lastPingAt: null, pingSource: null };
+  } catch (err: any) {
+    return { lastPingAt: null, pingSource: null, error: err?.message };
+  }
+}

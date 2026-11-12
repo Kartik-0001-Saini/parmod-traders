@@ -1,0 +1,50 @@
+name: Supabase Keep-Alive
+
+on:
+  # Runs automatically every 2 days at 05:00 UTC (10:30 AM IST)
+  schedule:
+    - cron: '0 5 */2 * *'
+
+  # Allows manual 1-click trigger from GitHub Actions tab
+  workflow_dispatch:
+
+jobs:
+  ping-database:
+    name: Write Keep-Alive Ping
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate Secrets Configuration
+        run: |
+          if [ -z "${{ secrets.SUPABASE_URL }}" ]; then
+            echo "❌ Error: SUPABASE_URL secret is missing in GitHub repository settings!"
+            exit 1
+          fi
+          if [ -z "${{ secrets.SUPABASE_SERVICE_KEY }}" ]; then
+            echo "❌ Error: SUPABASE_SERVICE_KEY secret is missing in GitHub repository settings!"
+            exit 1
+          fi
+          echo "✅ GitHub secrets validated."
+
+      - name: Insert Keep-Alive Row into Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          # Strip trailing slash from URL if present
+          CLEAN_URL="${SUPABASE_URL%/}"
+          
+          echo "Pinging Supabase database to prevent free-tier auto-pause..."
+          
+          # Perform authenticated POST write to keep_alive table
+          # -f / --fail: Exits with non-zero exit code if HTTP response is 4xx or 5xx
+          # -s -S: Silent output, but print server error messages if failure occurs
+          RESPONSE=$(curl -f -s -S \
+            -X POST "$CLEAN_URL/rest/v1/keep_alive" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "Content-Type: application/json" \
+            -H "Prefer: return=representation" \
+            -d '{"ping_source": "github-actions"}')
+          
+          echo "✅ Ping successful! Database record inserted:"
+          echo "$RESPONSE"
