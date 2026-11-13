@@ -304,8 +304,8 @@ export interface Database {
           p_variant_id: string;
           p_change_qty: number;
           p_reason: string;
-          p_performed_by: string;
           p_notes?: string | null;
+          p_original_movement_id?: string | null;
         };
         Returns: Json;
       };

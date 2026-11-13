@@ -20,7 +20,6 @@ interface AdjustStockModalProps {
   products: ProductItem[];
   initialProduct?: ProductItem | null;
   onStockAdjusted: () => void;
-  performedBy: string;
 }
 
 export function AdjustStockModal({
@@ -29,7 +28,6 @@ export function AdjustStockModal({
   products,
   initialProduct,
   onStockAdjusted,
-  performedBy,
 }: AdjustStockModalProps) {
   const { lang } = useLanguage();
   const isHindi = lang === "hi";
@@ -88,7 +86,6 @@ export function AdjustStockModal({
         variantId: currentProduct.id,
         changeQty,
         reason,
-        performedBy: performedBy || "Owner",
         notes: notes.trim() || (direction === "add" ? "Stock Inward / Delivery" : "Stock Correction"),
       });
 

@@ -305,7 +305,6 @@ export default function HomePage() {
       variantId: targetProduct.id,
       changeQty: quantityChange,
       reason: type === "sale" ? "sale" : "return",
-      performedBy: performer,
       notes: type === "sale" ? "Customer Sale" : "Customer Return",
     });
 
@@ -407,7 +406,6 @@ export default function HomePage() {
       changeQty: undoQty,
       reason: "undo",
       originalMovementId: movementId,
-      performedBy: performer,
       notes: `Undo of ${type === "sale" ? "Sale" : "Customer Return"}`,
     });
 
@@ -853,7 +851,6 @@ export default function HomePage() {
         onStockAdjusted={() => {
           loadInitialData();
         }}
-        performedBy={fullName || user?.email || (role === "owner" ? "Owner" : "Showroom Staff")}
       />
 
       {/* Mobile Bottom Navigation */}

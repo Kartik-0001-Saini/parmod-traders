@@ -251,7 +251,6 @@ export async function executeStockChange(params: {
   variantId: string;
   changeQty: number; // -1 for sale, +1 for return
   reason: "sale" | "return" | "manual_correction" | "stock_count" | "undo";
-  performedBy: string;
   notes?: string;
   originalMovementId?: string;
 }): Promise<{
@@ -281,7 +280,6 @@ export async function executeStockChange(params: {
       p_variant_id: params.variantId,
       p_change_qty: params.changeQty,
       p_reason: params.reason,
-      p_performed_by: params.performedBy,
       p_notes: params.notes || null,
       p_original_movement_id: params.originalMovementId || null,
     });
