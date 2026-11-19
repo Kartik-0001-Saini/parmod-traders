@@ -30,6 +30,7 @@ import { AddProductModal } from "@/components/AddProductModal";
 import { EditProductModal } from "@/components/EditProductModal";
 import { AdjustStockModal } from "@/components/AdjustStockModal";
 import { HistoryView } from "@/components/HistoryView";
+import { BillsManager } from "@/components/BillsManager";
 import { ProductItem, InventoryMovementRecord } from "@/lib/mock-data";
 import { useLanguage } from "@/lib/language-context";
 import { useAuth } from "@/lib/auth-context";
@@ -647,26 +648,11 @@ export default function HomePage() {
               /* Instant Skeleton Loader UI (Zero Layout Shift) */
               <ProductCardSkeleton count={6} />
             ) : activeTab === "bills" ? (
-              /* Tab: Scan Bill Preview for Phase 6 */
-              <div className="bg-white rounded-3xl p-6 border border-slate-200 text-center flex flex-col items-center gap-3 shadow-xs">
-                <div className="w-14 h-14 rounded-2xl bg-indigo-50 text-indigo-600 flex items-center justify-center">
-                  <Sparkles className="w-7 h-7" />
-                </div>
-                <h3 className="text-lg font-bold text-slate-900">
-                  {lang === "hi" ? "एआई बिल स्कैनर (फेज 6)" : "AI Purchase Bill Scanner"}
-                </h3>
-                <p className="text-xs text-slate-500 max-w-md">
-                  {lang === "hi"
-                    ? "यह फीचर फेज 6 में क्लॉड विजन (Claude Vision) के साथ जुड़ जाएगा। पर्ची या बिल की फोटो अपलोड करने पर सामान और खरीद रेट अपने आप पढ़ लिए जाएंगे।"
-                    : "This feature will connect in Phase 6 with Claude Vision AI. Upload any supplier invoice PDF or photo to automatically extract models, quantities, and purchase prices."}
-                </p>
-                <button
-                  onClick={() => setActiveTab("home")}
-                  className="mt-2 px-4 py-2 rounded-xl bg-slate-900 text-white text-xs font-bold hover:bg-slate-800"
-                >
-                  {lang === "hi" ? "दुकान के सामान पर वापस जाएँ" : "Back to Items"}
-                </button>
-              </div>
+              /* Tab: Purchase Bills Management (Phase 6 Sub-Phase A) */
+              <BillsManager
+                onOpenAuthModal={() => setIsAuthModalOpen(true)}
+                onOpenPinModal={() => setIsPinModalOpen(true)}
+              />
             ) : activeTab === "history" ? (
               /* Tab: Inventory Movements History (Phase 4 Filtered Audit View) */
               <HistoryView movements={movements} onRefresh={loadInitialData} />
