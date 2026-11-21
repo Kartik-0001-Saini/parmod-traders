@@ -57,3 +57,35 @@ print("Total qty:", tq, "(bill: 37)")
 print("Sum of amounts:", round(ta, 2))
 if below:
     print("Printed total:", num(below[0][2]))
+
+
+print()
+print("--- DESCRIPTIONS ---")
+hy = [h[1] for h in hsn]
+buckets = [[] for _ in hy]
+for x, y, text, c in toks:
+    if not (190 <= x <= 450) or c < 0.85:
+        continue
+    if text.isdigit() and len(text) <= 2:
+        continue
+    best, bd = None, 999
+    for i, h in enumerate(hy):
+        d = (y + 20) - h
+        if abs(d) < bd:
+            best, bd = i, abs(d)
+    if bd <= 14:
+        buckets[best].append((y, text))
+rows = []
+for b in buckets:
+    b.sort()
+    rows.append([t for _, t in b])
+for i in range(1, len(rows)):
+    first = rows[i][0] if rows[i] else ""
+    if re.fullmatch(r"GODREJ(2026)?", first):
+        rows[i - 1].append(first)
+        rows[i] = rows[i][1:]
+for i, r in enumerate(rows, 1):
+    s = " ".join(r)
+    s = re.sub(rf"^{i}(?=[A-Z0-9])", "", s)
+    s = re.sub(r"(?<=[A-Z])L$", "", s) if s.endswith("SAMSUNGL") else s
+    print(i, s)
