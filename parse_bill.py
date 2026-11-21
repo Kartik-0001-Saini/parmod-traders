@@ -89,3 +89,42 @@ for i, r in enumerate(rows, 1):
     s = re.sub(rf"^{i}(?=[A-Z0-9])", "", s)
     s = re.sub(r"(?<=[A-Z])L$", "", s) if s.endswith("SAMSUNGL") else s
     print(i, s)
+
+print()
+print("--- SUMMARY ---")
+CATS = {"WM": "Washing Machine", "AC": "Air Conditioner", "REF": "Refrigerator", "LED": "LED TV"}
+KNOWN = ["GODREJ", "SAMSUNG", "VOLTAS", "LG", "HAIRE", "HAIER", "LLOYD", "WHIRLPOOL",
+         "IFB", "BOSCH", "SONY", "PANASONIC", "DAIKIN", "HITACHI", "CARRIER", "BLUESTAR",
+         "BLUE STAR", "SYMPHONY", "CROMPTON", "BAJAJ", "USHA", "ORIENT", "KENSTAR",
+         "ONIDA", "TCL", "MI", "REDMI", "XIAOMI", "VU", "HISENSE", "MITSUBISHI",
+         "O GENERAL", "OGENERAL", "SHARP", "TOSHIBA", "VIDEOCON", "INTEX", "KELVINATOR",
+         "MARQ", "ACER", "THOMSON", "KODAK", "CELLO", "SANSUI"]
+
+def find_brand(x):
+    for b in sorted(KNOWN, key=len, reverse=True):
+        if x.replace(" ", "").endswith(b.replace(" ", "")):
+            return b
+    return None
+
+for i, r in enumerate(rows, 1):
+    s = " ".join(r)
+    s = re.sub(rf"^{i}(?=[A-Z0-9])", "", s)
+    t = re.sub(r"\s*2026$", "", s).strip()
+    note = ""
+    brand = find_brand(t)
+    if not brand and len(t) > 1:
+        brand = find_brand(t[:-1])
+        if brand:
+            t = t[:-1]
+            note = " (extra char removed)"
+    if brand:
+        before = t.replace(" ", "")[:-len(brand.replace(" ", ""))]
+    else:
+        brand = "NEW? " + t.split()[-1]
+        before = t.replace(" ", "")
+    cat = next((v for k, v in CATS.items() if s.startswith(k)), None)
+    if not cat:
+        cat = next((v for k, v in CATS.items() if before.endswith(k)), "Category needed")
+    ri = num(incl[i - 1][2])
+    q = float(re.match(r"\d+(?:\.\d+)?", qty[i - 1][2]).group())
+    print(f"{i:>2} {cat} | {brand} | rate/piece incl tax={ri:,.2f} | qty={q:g}{note}")
