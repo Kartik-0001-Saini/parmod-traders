@@ -3,7 +3,7 @@
 import React, { createContext, useContext, useState, useEffect } from "react";
 import { User, Session } from "@supabase/supabase-js";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
-import { UserRole } from "@/types/database.types";
+type UserRole = "owner" | "staff";
 
 /**
  * BEGINNER LESSON: Real Authentication Context

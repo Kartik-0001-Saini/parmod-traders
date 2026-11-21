@@ -280,8 +280,8 @@ export async function executeStockChange(params: {
       p_variant_id: params.variantId,
       p_change_qty: params.changeQty,
       p_reason: params.reason,
-      p_notes: params.notes || null,
-      p_original_movement_id: params.originalMovementId || null,
+      p_notes: params.notes ?? undefined,
+      p_original_movement_id: params.originalMovementId ?? undefined,
     });
 
     if (error) {
@@ -455,7 +455,7 @@ export async function createProductWithVariant(
       p_attributes: params.attributes || {},
       p_mrp: params.mrp,
       p_selling_price: params.sellingPrice,
-      p_purchase_price: params.purchasePrice ?? null,
+      p_purchase_price: params.purchasePrice ?? undefined,
       p_opening_stock: params.openingStock || 0,
       p_low_stock_threshold: params.lowStockThreshold || 2,
     });
@@ -512,7 +512,7 @@ export async function updateProductVariantDetails(
       p_attributes: params.attributes || {},
       p_selling_price: params.sellingPrice,
       p_mrp: params.mrp,
-      p_purchase_price: params.purchasePrice ?? null,
+      p_purchase_price: params.purchasePrice ?? undefined,
       p_low_stock_threshold: params.lowStockThreshold ?? 2,
     });
 
