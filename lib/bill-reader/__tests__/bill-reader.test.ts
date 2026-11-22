@@ -5,9 +5,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parseBill } from "../parse-bill";
-import { parseAmount, parseQuantityWithUnit, inferGstRate } from "../numbers";
+import { parseAmount, parseLooseMoney, parseQuantityWithUnit, inferGstRate } from "../numbers";
 import { gstinChecksumOk, normalizeGstin, parseDate } from "../header-fields";
 import { productHints } from "../product-hints";
+import { solveLine } from "../line-solver";
+import { cleanHsn } from "../table";
+import { straighten } from "../straighten";
+import { groupRows } from "../layout";
+import { matchByModel, CatalogItem } from "../match";
 import type { OcrPage, OcrWord } from "../types";
 
 const H = 20;
@@ -265,4 +270,102 @@ test("No readable heading: rate vs amount worked out by arithmetic", () => {
   assert.equal(bill.lines[1].description, "AC Stabilizer 2 KVA");
   assert.equal(bill.lines[1].hints.category, "Other Electronics");
   assert.ok(bill.warnings.some((x) => /heading not found/.test(x)));
+});
+
+// ---------------------------------------------------------------------------
+// Real phone photos (WhatsApp, tilted, curved) — cases taken from the real bills
+// ---------------------------------------------------------------------------
+
+test("parseLooseMoney: separators lost or misread, as on WhatsApp photos", () => {
+  assert.equal(parseLooseMoney("1220000")?.value, 12200, "decimal point lost — bills always print paise");
+  assert.ok(parseLooseMoney("1220000")?.alts.includes(1220000));
+  assert.equal(parseLooseMoney("10 300 00")?.value, 10300);
+  assert.equal(parseLooseMoney("26,101 69")?.value, 26101.69);
+  assert.equal(parseLooseMoney("20.762.71")?.value, 20762.71);
+  assert.equal(parseLooseMoney("12.627 12PCS")?.value, 12627.12);
+  assert.deepEqual(parseLooseMoney("8,305.08)"), { value: 8305.08, alts: [], quality: 1 });
+  assert.equal(parseLooseMoney("X1,120.50")?.value, 1120.5, "₹ read as X");
+  assert.equal(parseLooseMoney("WTT70DLIM"), null);
+});
+
+test("line solver: '400 PCS' is 4.00 PCS, a misread rate is rebuilt from amount ÷ qty", () => {
+  const s = solveLine({
+    qty: 400,
+    values: [
+      { value: 12200, alts: [1220000], quality: 0.6, role: null, text: "1220000", order: 0, count: 3 },
+      { value: 10338, alts: [103.38], quality: 0.4, role: null, text: "10,338 us|", order: 1, count: 3 },
+      { value: 41355.92, alts: [], quality: 1, role: null, text: "41,355.92", order: 2, count: 3 },
+    ],
+    percents: [],
+  });
+  assert.equal(s.quantity, 4);
+  assert.equal(s.rateExclTax, 10338.98);
+  assert.equal(s.rateInclTax, 12200);
+  assert.equal(s.amount, 41355.92);
+  assert.equal(s.gstRate, 18);
+  assert.ok(s.autoFixed.some((f) => f.startsWith("quantity 400 → 4")));
+  assert.deepEqual(s.flags, []);
+});
+
+test("line solver: Ahujas layout — amount half-read, CGST + line total agree", () => {
+  // "1.36" is what was left of 22,881.36; CGST 9% = 2,059.32; total 27,000.00
+  const s = solveLine({
+    qty: 2,
+    values: [
+      { value: 1.36, alts: [], quality: 1, role: null, text: "1.36", order: 0, count: 3 },
+      { value: 2059.32, alts: [], quality: 1, role: null, text: "2,059.32", order: 1, count: 3 },
+      { value: 27000, alts: [], quality: 1, role: null, text: "27,000.00", order: 2, count: 3 },
+    ],
+    percents: [
+      { value: 9, text: "9%" },
+      { value: 9, text: "9%" },
+    ],
+  });
+  assert.equal(s.gstRate, 18);
+  assert.equal(s.taxableValue, 22881.36);
+  assert.equal(s.amount, 22881.36, "Amount column is before tax on this layout");
+  assert.equal(s.amountIncludesTax, false);
+  assert.equal(s.rateExclTax, 11440.68);
+  assert.equal(s.rateInclTax, 13500);
+  assert.deepEqual(s.flags, []);
+});
+
+test("HSN: letter misreads fixed, damaged codes snapped, real codes kept", () => {
+  assert.equal(cleanHsn("g4182100"), "84182100");
+  assert.equal(cleanHsn("Ba182100"), "84182100");
+  assert.equal(cleanHsn("84152100"), "84182100", "not a real code, one digit from a fridge code");
+  assert.equal(cleanHsn("85044090"), "85044090", "a real code that is not in the list stays");
+  assert.equal(cleanHsn("1,13,983.05"), null);
+});
+
+test("GSTIN: ambiguous misreads resolved by the check digit", () => {
+  assert.equal(normalizeGstin("06AAQCAT37EN1ZU"), "06AAQCA7376N1ZU");
+  assert.equal(gstinChecksumOk("06AAQCA7376N1ZU"), true);
+});
+
+test("straighten: a tilted page's rows come back together", () => {
+  // Three item rows tilted by 3%: the amount at the right sits ~a row lower than the description.
+  const words: OcrWord[] = [];
+  for (let r = 0; r < 12; r++) {
+    for (let c = 0; c < 6; c++) {
+      const x = 50 + c * 180;
+      const y = 300 + r * 30 + x * 0.03;
+      words.push({ text: c === 0 ? `ITEM${r}` : `${r}${c},000.00`, conf: 90, x0: x, y0: y, x1: x + 120, y1: y + 18 });
+    }
+  }
+  const before = groupRows(words, 18);
+  const after = groupRows(straighten(words, 18).words, 18);
+  assert.ok(before.length > 12, "tilt splits rows");
+  assert.equal(after.length, 12);
+  assert.ok(after.every((row) => row.words.length === 6));
+});
+
+test("match: model number found inside the supplier's description", () => {
+  const catalog: CatalogItem[] = [
+    { id: "a", modelNumber: "GL-T2516WXDS", variantName: "Silver", brand: "LG", productName: "Double Door 251 L", categoryId: null, categoryName: "", currentStock: 2 },
+    { id: "b", modelNumber: "WTT70DLIM/UHA", variantName: "Top Load", brand: "Voltas", productName: "WM 7 Kg", categoryId: null, categoryName: "", currentStock: 0 },
+  ];
+  assert.equal(matchByModel("REF -GLT2516WXDS D.DOOR LG 251 LITER", catalog)?.id, "a");
+  assert.equal(matchByModel("WM-7 KG WTT70DLIM/UHA VOLTAS", catalog)?.id, "b");
+  assert.equal(matchByModel("LG 1.5 Ton Split AC", catalog), null);
 });

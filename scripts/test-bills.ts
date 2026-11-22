@@ -20,11 +20,12 @@ import fs from "node:fs";
 import path from "node:path";
 import sharp from "sharp";
 import { createCanvas } from "@napi-rs/canvas";
-import { parseBill, pdfTextToPage, isScannedPage, formatINR } from "../lib/bill-reader";
-import type { OcrPage, ParsedBill, PdfTextItem } from "../lib/bill-reader";
+import { pdfTextToPage, isScannedPage, formatINR } from "../lib/bill-reader";
+import type { OcrPage, ParsedBill, ParseOptions, PdfTextItem } from "../lib/bill-reader";
 import { createBillOcr, BillOcr } from "../lib/bill-reader/ocr-tesseract";
 import { GrayImage, toGray } from "../lib/bill-reader/image";
-import { OcrEngine, PageReadInfo, extractText, prepareImage } from "../lib/bill-reader/pipeline";
+import { OcrEngine, PageReadInfo } from "../lib/bill-reader/pipeline";
+import { PageSource, extractAll, prepareAll, understand } from "../lib/bill-reader/read-bill";
 
 const IMAGE_EXT = new Set([".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"]);
 const PDF_TEXT_SCALE = 3; // coordinate scale for digital-PDF text
@@ -52,25 +53,20 @@ interface ReadResult {
   info: (PageReadInfo | null)[];
 }
 
-/** Same steps the app runs: which way up → text size → OCR. */
-async function readGray(gray: GrayImage, engine: OcrEngine): Promise<{ page: OcrPage; info: PageReadInfo }> {
-  const prepared = await prepareImage(gray, engine);
-  return { page: await extractText(prepared, engine), info: prepared.info };
-}
-
-async function readImage(file: string, engine: OcrEngine): Promise<ReadResult> {
+/** A photo → one page of grey pixels (the browser does the same with a canvas). */
+async function imageSource(file: string): Promise<PageSource[]> {
   // .rotate() applies the phone's EXIF orientation, like the browser does.
   const { data, info } = await sharp(file).rotate().raw().toBuffer({ resolveWithObject: true });
-  const r = await readGray(toGray(data, info.width, info.height, info.channels), engine);
-  return { pages: [r.page], info: [r.info] };
+  return [{ kind: "image", image: toGray(data, info.width, info.height, info.channels) }];
 }
 
-async function readPdf(file: string, engine: OcrEngine): Promise<ReadResult> {
+/** A PDF → pages: exact text for digital pages, pixels for scanned ones. */
+async function pdfSources(file: string): Promise<PageSource[]> {
   const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
   const data = new Uint8Array(fs.readFileSync(file));
   const task = pdfjs.getDocument({ data });
   const doc = await task.promise;
-  const result: ReadResult = { pages: [], info: [] };
+  const out: PageSource[] = [];
   for (let n = 1; n <= doc.numPages; n++) {
     const page = await doc.getPage(n);
     const textViewport = page.getViewport({ scale: PDF_TEXT_SCALE });
@@ -78,8 +74,7 @@ async function readPdf(file: string, engine: OcrEngine): Promise<ReadResult> {
     const items = text.items.filter((i): i is PdfTextItem & typeof i => "str" in i);
     const textPage = pdfTextToPage(items as PdfTextItem[], textViewport, PDF_TEXT_SCALE);
     if (!isScannedPage(textPage)) {
-      result.pages.push(textPage);
-      result.info.push(null);
+      out.push({ kind: "text", page: textPage });
       continue;
     }
     // Scanned page / photo saved as PDF: render at the embedded photo's own resolution
@@ -92,12 +87,17 @@ async function readPdf(file: string, engine: OcrEngine): Promise<ReadResult> {
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     await page.render({ canvas: canvas as unknown as HTMLCanvasElement, viewport }).promise;
     const rgba = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const r = await readGray(toGray(rgba.data, canvas.width, canvas.height, 4), engine);
-    result.pages.push(r.page);
-    result.info.push(r.info);
+    out.push({ kind: "image", image: toGray(rgba.data, canvas.width, canvas.height, 4) });
   }
   await task.destroy(); // pdf.js 6: destroy lives on the loading task
-  return result;
+  return out;
+}
+
+/** Same steps the app runs: which way up → text size → OCR → zoom on the table. */
+async function readFile(file: string, engine: OcrEngine, options: ParseOptions): Promise<ReadResult> {
+  const sources = path.extname(file).toLowerCase() === ".pdf" ? await pdfSources(file) : await imageSource(file);
+  const prepared = await prepareAll(sources, engine);
+  return extractAll(prepared, engine, options);
 }
 
 /** Render scale that shows the page's largest embedded image at 1:1 (between 1.5× and 4×). */
@@ -230,6 +230,16 @@ async function main() {
   const outDir = path.join(folder, "results");
   fs.mkdirSync(outDir, { recursive: true });
 
+  // Optional <folder>/_config.json: what the app knows when it reads a bill —
+  //   { "ownGstin": "06…", "knownSuppliers": [{ "name": "…", "gstin": "…" }] }
+  const configFile = path.join(folder, "_config.json");
+  const parseOptions: ParseOptions = fs.existsSync(configFile) ? JSON.parse(fs.readFileSync(configFile, "utf8")) : {};
+  if (fs.existsSync(configFile)) {
+    console.log(
+      `Using _config.json: own GSTIN ${parseOptions.ownGstin ?? "—"}, ${parseOptions.knownSuppliers?.length ?? 0} known supplier(s)`
+    );
+  }
+
   const files = fs
     .readdirSync(folder, { withFileTypes: true })
     .filter((d) => d.isFile() && !d.name.startsWith("_") && !d.name.startsWith("."))
@@ -259,11 +269,9 @@ async function main() {
       const read: ReadResult =
         cached && fs.existsSync(cachedOcr)
           ? { pages: JSON.parse(fs.readFileSync(cachedOcr, "utf8")), info: [] }
-          : path.extname(file).toLowerCase() === ".pdf"
-            ? await readPdf(full, engine)
-            : await readImage(full, engine);
+          : await readFile(full, engine, parseOptions);
       const pages = read.pages;
-      const bill = parseBill(pages);
+      const bill = understand(pages, parseOptions);
       const seconds = (Date.now() - started) / 1000;
       printBill(file, bill, seconds);
       read.info.forEach((info, i) => {

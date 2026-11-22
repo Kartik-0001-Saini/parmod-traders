@@ -1,165 +1,124 @@
 # Bill Reader
 
-Reads a supplier bill (phone photo, scan, or PDF) and turns it into structured
-data: supplier, GSTIN, invoice number/date, IRN, and every item line (description,
-HSN, qty, rate, rate incl. tax, GST %, amount), then checks the arithmetic.
+Reads a supplier bill (phone photo, scan, or PDF) **inside the app, on the phone**
+(free — Tesseract OCR in the browser, nothing sent to an AI service), shows each
+step live, lets the owner review, and adds the stock in one all-or-nothing step.
 
-It replaces `parse_bill.py`. Same idea (OCR words with positions → columns →
-qty × rate checks), but it finds the columns from the **heading text** on each bill
-instead of fixed pixel ranges, so zoom, crop, and different phones don't break it.
-The Python scripts are left in the repo untouched.
-
-## How it works
+## What the owner sees
 
 ```
-photo / scan ──▶ Tesseract OCR (sparse-text mode) ──┐
-digital PDF ───▶ pdf.js text (exact, no OCR) ───────┼──▶ words + positions
-scanned PDF ───▶ render page ──▶ Tesseract OCR ─────┘          │
-                                                                ▼
-                                                     parseBill()
-   1. group words into rows
-   2. find the table heading (Description · HSN · Qty · Rate · Rate (incl. of Tax) · per · Amount)
-      and use the heading positions as column guides
-   3. rows with a qty and an amount = items; text-only rows below = rest of the description
-   4. no readable heading? recognise values by shape (8-digit HSN, "2 PCS", money)
-      and work out rate vs amount by arithmetic
-   5. check every line: qty × rate = amount, rate incl ÷ rate = a GST rate
-      → if two numbers agree and one doesn't, the odd one was misread:
-        correct it and say so ("fixed: …"); otherwise flag the line
-   6. read totals (qty, sub-total, CGST, SGST, IGST, round-off, grand total) and cross-check
-                                                                ▼
-                                    ParsedBill  (lib/bill-reader/types.ts)
+Upload bill ──▶ 1. Reading the image      which way up, how big the text is
+                2. Extracting the text    OCR, then the item table again, zoomed in
+                3. Understanding the bill columns, qty × rate = amount, GST, totals
+                4. Saving to database     lines saved for review (status "extracted")
+            ──▶ Review & add to stock     fix anything yellow, pick / create products
+                1. Checking the lines
+                2. Adding to stock        one database transaction
 ```
 
-Why Tesseract and not PaddleOCR (what RapidOCR uses): on the sample bills both
-read the item rows, but PaddleOCR returned each table row as one piece with spaces
-dropped ("BlueStar 1.5TonAC"), losing the columns. Tesseract returns each word
-with its position. Tesseract's default page mode skipped tables with grid lines,
-so the **sparse-text** mode is required (`ocr-tesseract.ts`).
+If a step fails, **only that step turns red**, with the reason and a "Try again" that
+continues from that step. In the review, a line with a problem (missing quantity,
+duplicate model number…) is outlined red with the reason; nothing is saved until
+every line is fine.
+
+## Setup (once)
+
+Run in the Supabase SQL editor, in order:
+
+1. `supabase/migrations/011_require_login_for_reads.sql` (login required to read data)
+2. `supabase/migrations/012_bill_reading_and_confirm.sql` (bill reading + add to stock)
+
+Both are safe to run twice. 012 was tested on a local PostgreSQL with all migrations
+001–012 (save, re-read, duplicate e-invoice, missing quantity → nothing changed,
+confirm, confirm twice refused, staff refused).
+
+The shop's GSTIN is in `lib/shop-config.ts` (override with `NEXT_PUBLIC_SHOP_GSTIN`).
+The reader uses it so the shop (the buyer on every bill) is never taken as the supplier.
+
+## How it reads a photo
+
+| Problem on real phone photos | What the reader does | File |
+|---|---|---|
+| Photo sideways / upside down | OCR at 0°, 180°, 90°, 270° until one reads well | `pipeline.ts` |
+| WhatsApp shrinks to 1200×1600 → table text 6–11 px | Measure text height, enlarge so text ≈ 24 px | `pipeline.ts` |
+| Table text is the smallest on the page | Read the table strip again at ≈ 36 px; keep whichever read checks out (items and totals chosen separately) | `pipeline.ts`, `read-bill.ts` |
+| Page tilted / curled / shot at an angle → amounts a row off | Find the smooth shift that lines the words up into rows, subtract it | `straighten.ts` |
+| Numbers damaged: `1220000`, `10 300 00`, `20.762.71`, `X1,120.50` | Bills print paise → put the separators back; ₹ misread as X / ¥ | `numbers.ts` |
+| One number on a line misread | Every number votes for the line's before-tax value under each role it could have (rate, rate incl. tax, amount, taxable, CGST/SGST, total); the reading most numbers agree on wins, the odd ones are corrected and reported ("fixed: …") | `line-solver.ts` |
+| `200 PCS` = 2.00 PCS, `g4182100` = 84182100 | Quantity / HSN repair, checked by the arithmetic | `line-solver.ts`, `table.ts` |
+| Different layouts (Jindal / Tally, Ahujas / LG with per-line CGST/SGST, Batch rows) | Headings only *suggest* roles; arithmetic decides | `table.ts`, `layout.ts` |
+| One line unreadable | Sub-total − other lines | `parse-bill.ts` |
+| Supplier name / GSTIN half-read | Check-digit-guided GSTIN repair; suppliers already in the app recognised from fragments | `header-fields.ts` |
+
+Digital PDFs are read from their text layer (exact, ~0.1 s). Photos inside PDFs are
+rendered at the photo's own resolution and read like photos.
 
 ## Files
 
 | File | What it does |
 |---|---|
-| `lib/bill-reader/types.ts` | Data shapes: `OcrWord`, `OcrPage`, `BillLine`, `ParsedBill` |
-| `lib/bill-reader/parse-bill.ts` | `parseBill(pages)`: the main logic (steps 1–6 above) |
-| `lib/bill-reader/layout.ts` | Rows, heading detection, column boundaries |
-| `lib/bill-reader/numbers.ts` | Indian amounts (`2,59,110.00`), qty + unit, GST rates |
-| `lib/bill-reader/header-fields.ts` | Supplier/buyer, GSTIN (with check digit), invoice no., date, IRN |
-| `lib/bill-reader/product-hints.ts` | Brand / category / size / model guesses for matching |
-| `lib/bill-reader/ocr-tesseract.ts` | OCR engine wrapper (works in browser and Node) |
-| `lib/bill-reader/pdf.ts` | Turns pdf.js text into words; detects scanned pages |
-| `lib/bill-reader/__tests__/bill-reader.test.ts` | Unit tests (hand-built bills, no OCR) |
-| `scripts/test-bills.ts` | Reads a folder of bills and prints a report |
+| `lib/bill-reader/read-bill.ts` | The steps (prepare → extract + zoom → understand). Used by the app **and** the test script |
+| `lib/bill-reader/browser.ts` | Browser only: photos/PDFs → pages, Tesseract in a web worker |
+| `lib/bill-reader/pipeline.ts` | Which way up, text size, zoomed table read |
+| `lib/bill-reader/image.ts` | Grey / rotate / resize / crop (same code in browser and Node) |
+| `lib/bill-reader/straighten.ts` | Page straightening |
+| `lib/bill-reader/parse-bill.ts` | `parseBill(pages, options)`: table, totals, bill-level checks |
+| `lib/bill-reader/table.ts` | Table rows → serial, description, HSN, qty, numbers |
+| `lib/bill-reader/line-solver.ts` | The arithmetic that fixes misread numbers |
+| `lib/bill-reader/header-fields.ts` | Supplier, GSTIN, invoice no./date, IRN |
+| `lib/bill-reader/match.ts` | Bill line → product (supplier memory, model number, suggestions) |
+| `lib/services/bill-reading-service.ts` | Save reading, load lines, add to stock (database functions in migration 012) |
+| `components/bills/BillReaderModal.tsx` | The 4 live steps |
+| `components/bills/BillReviewModal.tsx` | Review & add to stock |
+| `scripts/test-bills.ts` | Reads a folder of bills, prints a report and a score |
 
-Everything in `lib/bill-reader` runs in both the browser and Node. The app will
-use the same parser later.
-
-## Run it on real bills
-
-Needs Node 20+ and internet on the first run (downloads the ~5 MB English OCR model
-into `node_modules/.cache/bill-reader`).
+## Test on real bills (laptop)
 
 ```powershell
 cd <path-to>\parmod-traders
 npm install
-npm test                                   # 14 unit tests, should all pass
-npm run bills:read -- "D:\bills\real"      # any folder of .jpg/.png/.webp/.tif/.pdf
+npm test                                        # 21 unit tests
+npm run bills:read -- "D:\bills\real"           # .jpg .png .webp .pdf …
+npm run bills:read -- "D:\bills\real" --cached  # re-parse saved OCR (seconds; for parser work)
 ```
 
-`npm run bills:read` with no folder reads `.\testbill` (already git-ignored, so bill
-images are never committed). Add `--verbose` to also print the raw OCR rows.
+Optional files in the bills folder (names starting with `_` are not read as bills):
 
-Files and folders starting with `_` are skipped.
+- `_config.json` — what the app knows: `{ "ownGstin": "06…", "knownSuppliers": [{ "name": "…", "gstin": "…" }] }`
+- `<bill>.expected.json` — what is printed on the bill; the script prints a score
+  (descriptions count as right at ≥ 90 % the same, so one misread letter is OK).
 
-### What to send back
+Results go to `<folder>\results\` (`<bill>.json`, `<bill>.ocr.json`). They contain real
+bill data — share privately.
 
-For each bill the script writes, next to the bills:
+## Results (2026-11-22)
 
-- `results\<bill>.json`: what was parsed
-- `results\<bill>.ocr.json`: the raw OCR words (lets the parser be fixed without the photo)
+Five **real** bills (WhatsApp photos, one photo-in-PDF), with the shop GSTIN and the two
+suppliers known (as in the app after their first bill):
 
-Send the whole `results` folder and the console output. These contain real bill
-data (GSTINs, amounts), so share them privately.
+| Bill | Photo | Fields correct |
+|---|---|---|
+| Jindal 4-Nov | on a table, tilted, newspaper around | 61 / 64 |
+| Jindal 21-Nov (PDF) | bill fills half the photo, text 8 px | 81 / 85 |
+| Ahujas 16-Sep | sideways, held in hand | 31 / 35 |
+| Ahujas 1-Oct | upside down | 22 / 25 |
+| Jindal 1-Oct | held in hand, page curled at the bottom | 31 / 60 |
+| **All** | | **226 / 269 (84 %)** |
 
-### Measuring accuracy (optional, recommended for 3–5 bills)
+Before this work the same five bills gave 0 item lines. Generated sample images:
+200 / 208. Speed on a laptop: 10–35 s per photo; phones will be slower.
 
-Put a `<bill>.expected.json` next to a bill with what is actually printed on it.
-The script then prints a score and lists every wrong field. Any field can be left out.
-
-```json
-{
-  "header": {
-    "supplierName": "JINDAL ELECTRONICS",
-    "supplierGstin": "06AAPFJ7674N1ZF",
-    "invoiceNumber": "26-27/7001",
-    "invoiceDate": "2026-11-15"
-  },
-  "lines": [
-    { "description": "Godrej 7 Kg Fully Automatic Top Load WM", "hsn": "84501100",
-      "quantity": 2, "rateExclTax": 15000, "rateInclTax": 17700, "amount": 30000 }
-  ],
-  "totals": { "totalQuantity": 4, "subtotal": 76610.17, "cgst": 6894.92, "sgst": 6894.92, "grandTotal": 90400 }
-}
-```
-
-## Reading the report
-
-```
-#   Description             HSN        Qty   Rate       Rate+Tax   GST  Amount     Notes
-2   Smart Watch             91021200   10 PCS 2,500.00  2,950.00   18%  29,500.00  fixed: amount 500.00 → 29,500.00 (taxable + 18% GST)
-6   LED Bulb 9W             85395200   ? PCS  …                                    Quantity not read
-  ✔ Grand total: sub-total + tax = 80,664.80, bill says 80,664.80
-  ! SGST 26,152.40 read as 6,152.40 (₹ sign misread as a digit)
-```
-
-- **OK**: every number on the line agrees.
-- **fixed: …**: one number was misread, and the others agree on what it must be. The
-  correction is applied and shown. The app will show these to the owner too.
-- **Flag** (e.g. `Quantity not read`, `qty × rate ≠ amount`): the reader couldn't
-  confirm the line. The owner must check it in the review screen.
-- **✔ / ✘ checks**: bill-level totals. A ✘ can mean an OCR misread *or* a bill that
-  really doesn't add up.
-- **!**: warnings, e.g. a GSTIN that fails its check digit (a misread character, or a
-  typo on the bill).
-
-## Results on the sample bills (2026-11-21)
-
-The samples in `testbill\` are **generated test images, not real bills**. Several
-don't add up themselves (e.g. "Total 5 PCS" over lines adding to 6), and the reader
-correctly flags those.
-
-| Bill | Fields correct |
-|---|---|
-| test_invoice_01.png | 33 / 33 |
-| test_invoice_05.png | 38 / 38 |
-| Home Appliance Tax Invoice.png (Jindal format) | 34 / 35: one IRN character misread |
-| collage-gst-5.png (cut from a collage, ~500 px wide) | 30 / 32: "6866" for "6666", smudged CGST |
-| sample-text-bill.pdf (digital PDF, Tally format) | 32 / 32 in 0.1 s |
-| sample-scanned-bill.pdf (image inside a PDF) | 38 / 38 |
-
-Speed: about 2–8 s per photo on a laptop, about 0.1 s for a digital PDF.
-
-**Still unknown: accuracy on real phone photos.** Real photos have shadows, folds,
-tilt and blur that the generated images don't. That is what this run on real bills
-is for.
+The browser path was run in Edge (headless) on two of the real bills: same results as
+Node for the Ahujas photo; for the PDF the browser renders slightly different pixels, so
+OCR results differ a little (11 lines found, totals missed in that run).
 
 ## Known limits
 
-- Photos should be roughly straight and the whole table visible. A strong tilt or
-  a folded page will lose rows (they get flagged, not invented).
-- Very small images (under ~1,300 px on the long side) are enlarged before OCR, but
-  accuracy drops (see the collage crops).
+- Photos held in the hand with the page curling away (Jindal 1-Oct) lose the bottom rows.
+- WhatsApp-forwarded photos are 1200×1600; the original camera photo or the supplier's PDF
+  reads much better.
+- Multi-page bills: add every page to the same upload; lines from all pages are joined,
+  totals come from the last page that has them.
 - Handwriting and stamps are not read.
-- Multi-page bills: lines from all pages are joined, header from page 1, totals from
-  the last page that has them.
-
-## Next (not built yet)
-
-1. "Read bill" button in the app: runs this reader in the browser on an uploaded bill
-   and saves the lines to `bill_lines` (status → `extracted`).
-2. Review screen: bill photo next to the lines; match each line to a product
-   (remembered supplier matches first, then model number) or create a new one.
-3. Confirm: one all-or-nothing database function that adds the stock
-   (`inventory_movements` reason `purchase_bill`), updates purchase prices (incl. and
-   excl. tax), remembers the matches, and marks the bill `confirmed`.
+- Not yet tested end-to-end in the deployed app with a real owner login (the database
+  functions and the browser reader were tested separately — see above).

@@ -9,8 +9,14 @@
  */
 export * from "./types";
 export { parseBill } from "./parse-bill";
+export type { ParseOptions } from "./parse-bill";
 export { pdfTextToPage, isScannedPage } from "./pdf";
 export type { PdfTextItem } from "./pdf";
 export { productHints } from "./product-hints";
 export { gstinChecksumOk, normalizeGstin, parseDate } from "./header-fields";
-export { formatINR, parseAmount, inferGstRate } from "./numbers";
+export type { KnownSupplier } from "./header-fields";
+export { formatINR, parseAmount, inferGstRate, round2 } from "./numbers";
+export { toGray, rotate, resize } from "./image";
+export type { GrayImage, QuarterTurn } from "./image";
+export { prepareImage, extractText } from "./pipeline";
+export type { OcrEngine, PageReadInfo, PreparedImage, StepCallbacks } from "./pipeline";

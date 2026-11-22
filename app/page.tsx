@@ -152,6 +152,15 @@ function ShowroomApp() {
     loadInitialData();
   }, []);
 
+  // After a purchase bill is added to stock: reload products, history and costs quietly
+  // (no loading skeleton, so the Bills screen stays open).
+  const refreshAfterStockChange = async () => {
+    const [prodResult, histResult] = await Promise.all([fetchShowroomProducts(), fetchMovementHistory()]);
+    if (!prodResult.error) setProducts(prodResult.products);
+    setMovements(histResult || []);
+    if (isOwner) setOwnerCostMap(await fetchOwnerCostMap());
+  };
+
   // Fetch Owner Purchase Costs securely ONLY when user is authenticated as Owner
   useEffect(() => {
     if (isOwner) {
@@ -674,6 +683,7 @@ function ShowroomApp() {
               <BillsManager
                 onOpenAuthModal={() => setIsAuthModalOpen(true)}
                 onOpenPinModal={() => setIsPinModalOpen(true)}
+                onStockChanged={refreshAfterStockChange}
               />
             ) : activeTab === "history" ? (
               /* Tab: Inventory Movements History (Phase 4 Filtered Audit View) */

@@ -2,451 +2,64 @@
  * parseBill(): OCR words → structured bill (header, item lines, totals, checks).
  *
  * How it reads the goods table:
- *  1. Group words into rows.
- *  2. Find the heading row ("Description … HSN … Qty … Rate … Amount") and use
- *     the heading positions as column guides (no fixed pixels).
- *  3. Each row with a quantity and an amount is an item; text-only rows under
- *     an item continue its description.
- *  4. If the heading wasn't readable, recognise values by shape instead
- *     (8-digit HSN, "2 PCS", money) and work out rate vs amount by arithmetic.
- *  5. Check every line (qty × rate = amount, incl ÷ excl = a GST rate). If two
- *     values agree and one doesn't, the odd one was misread: correct it and say so.
- *  6. Read totals (qty, sub-total, CGST/SGST/IGST, grand total) and cross-check.
+ *  1. Straighten the page (phone photos are tilted / curved) and group words into rows.
+ *  2. Find the heading row ("Description … HSN … Qty … Rate … Amount"). If it is
+ *     unreadable, start at the first row that looks like an item (HSN + qty/amount).
+ *  3. Rows with an HSN / quantity and numbers are items; text-only rows under an item
+ *     continue its description; "Batch :" rows are skipped.
+ *  4. Each item's numbers go to the line solver (line-solver.ts), which finds the
+ *     reading where qty × rate, rate incl. tax, amount, taxable, CGST/SGST and total
+ *     all agree, and corrects the numbers that don't.
+ *  5. Bill-level fixes: GST rate from the other lines; one unreadable line from the
+ *     sub-total minus the other lines.
+ *  6. Read totals (qty, sub-total, CGST/SGST/IGST, round-off, grand total) and cross-check.
  */
-import {
-  BillCheck,
-  BillLine,
-  BillTotals,
-  ColumnAnchor,
-  ColumnRole,
-  OcrPage,
-  OcrWord,
-  ParsedBill,
-} from "./types";
-import { Row, centerX, cleanWords, columnOf, findHeader, groupRows, medianHeight, rowText } from "./layout";
-import {
-  amountMatches,
-  formatINR,
-  GST_SLABS,
-  inferGstRate,
-  isHsn,
-  isUnit,
-  looksLikeMoney,
-  parseAmount,
-  parsePercent,
-  parseQuantityWithUnit,
-  round2,
-  totalsMatch,
-} from "./numbers";
-import { readHeader } from "./header-fields";
+import { BillCheck, BillLine, BillTotals, ColumnAnchor, ColumnRole, OcrPage, OcrWord, ParsedBill } from "./types";
+import { Row, cleanWords, findHeader, groupRows, medianHeight, rowText } from "./layout";
+import { formatINR, GST_SLABS, looksLikeMoney, parseAmount, parseLooseMoney, parseQuantityWithUnit, round2, totalsMatch } from "./numbers";
+import { HeaderOptions, readHeader } from "./header-fields";
 import { productHints } from "./product-hints";
+import { straighten } from "./straighten";
+import { ItemRow, cleanHsn, looksLikeItemRow, readItemRow } from "./table";
+import { LineSolution, solveLine } from "./line-solver";
 
-/** First word of a row that ends the goods table. */
-const FOOTER_START = /^(total|sub-?total|taxable|cgst|sgst|utgst|igst|grand|round|less|amount|tax|e\.?&o)/i;
+/** Row labels that end the goods table (after normalising OCR damage, see labelText). */
+const FOOTER_LABEL = /^(total|subtotal|taxable|cgst|sgst|utgst|igst|grand|round|less|amount|tax|eoe|coin|continued)/;
 
-/** Raw values read from one table row, before checking. */
-interface RawLine {
-  sl: number | null;
+/**
+ * Lower-case letters of a row label with common OCR damage undone:
+ * "C.G.5.T|" → "cgst", "S.G.ST" → "sgst", "R0UND" → "round".
+ */
+function labelText(text: string): string {
+  const t = text
+    .toLowerCase()
+    .replace(/[.|_:;'"`,]/g, "")
+    .replace(/(?<=[a-z])5|5(?=[a-z])/g, "s")
+    .replace(/(?<=[a-z])0|0(?=[a-z])/g, "o")
+    .replace(/(?<=[a-z])7|7(?=[a-z])/g, "t")
+    .replace(/\s+/g, " ")
+    .trim();
+  // One wrong letter in a tax label: "sgsr" / "cgsy" / "sgs7" → sgst / cgst.
+  return t.replace(/\b([cs]gs[a-z]|[cs]g[a-z]t|igs[a-z])\b/g, (m) => m.slice(0, 3) + "t").replace(/\b(sgst|cgst|igst)[a-z]\b/g, "$1");
+}
+
+function isFooterRow(row: Row): boolean {
+  const first = labelText(row.words.slice(0, 2).map((w) => w.text).join("")).replace(/\s/g, "");
+  const hasHsn = row.words.some((w) => cleanHsn(w.text)?.length === 8);
+  if (hasHsn) return false;
+  if (/in ?words|chargeable|continued/.test(labelText(rowText(row)))) return true;
+  // Allow a stray mark before the label ("Cc.G.S.T" → "ccgst").
+  return FOOTER_LABEL.test(first) || FOOTER_LABEL.test(first.slice(1)) || /^.?(c|s|i)gst/.test(first);
+}
+
+// ---------------------------------------------------------------------------
+// Item rows → lines
+// ---------------------------------------------------------------------------
+
+interface Item {
+  row: ItemRow;
   description: string;
-  hsn: string | null;
-  qty: number | null;
-  unit: string | null;
-  rate: number | null;
-  rateIncl: number | null;
-  taxable: number | null;
-  amount: number | null;
-  gstPct: number | null;
-  /** Fields whose text looked damaged. */
-  suspicious: Set<string>;
-  /** Money values in left→right order when no heading was available. */
-  unlabeledMoney: number[] | null;
-  /** The words those values came from (same order). */
-  unlabeledWords: OcrWord[] | null;
-  /** Column each of those values sits under, if a (partial) heading was found. */
-  unlabeledRoles: (ColumnRole | null)[] | null;
-  /** x position where numbers start (for telling description continuations apart). */
-  firstValueX: number;
-}
-
-// ---------------------------------------------------------------------------
-// Row → RawLine
-// ---------------------------------------------------------------------------
-
-function readMoney(words: OcrWord[], field: string, suspicious: Set<string>): number | null {
-  if (words.length === 0) return null;
-  const parsed = parseAmount(words.map((w) => w.text).join(""));
-  if (!parsed) return null;
-  if (parsed.suspicious || words.some((w) => w.conf < 60)) suspicious.add(field);
-  return parsed.value;
-}
-
-function readQty(words: OcrWord[]): { qty: number | null; unit: string | null } {
-  const text = words.map((w) => w.text).join(" ").trim();
-  if (!text) return { qty: null, unit: null };
-  const withUnit = parseQuantityWithUnit(text.replace(/\s+/g, " "));
-  if (withUnit) return { qty: withUnit.value, unit: withUnit.unit };
-  const m = /^(\d+(?:\.\d+)?)/.exec(text);
-  return m ? { qty: Number(m[1]), unit: null } : { qty: null, unit: null };
-}
-
-function cleanHsn(text: string): string | null {
-  // Amounts ("1,13,983.05") are never HSN codes, even though they have 8 digits.
-  if (/[.,]/.test(text)) return null;
-  const t = text.replace(/[Oo]/g, "0").replace(/[Il|]/g, "1").replace(/[^0-9]/g, "");
-  return isHsn(t) ? t : null;
-}
-
-/** Could this text be a value of that column? */
-function fitsColumn(role: ColumnRole, text: string): boolean {
-  switch (role) {
-    case "hsn":
-      return cleanHsn(text) !== null;
-    case "qty":
-      return /^\d/.test(text) || isUnit(text);
-    case "per":
-      return isUnit(text);
-    case "gstPct":
-      return /\d|%/.test(text);
-    default:
-      return /\d/.test(text) || /^(₹|rs\.?)$/i.test(text);
-  }
-}
-
-/** Read a row using the heading's column positions. */
-function readRowByColumns(row: Row, anchors: ColumnAnchor[]): RawLine {
-  const cells: Partial<Record<ColumnRole, OcrWord[]>> = {};
-  const hasAmountColumn = anchors.some((a) => a.role === "amount");
-  // Leftmost real value in the row: text left of it is still description, wherever it fell.
-  const firstValueX0 = Math.min(
-    ...row.words.filter((w) => cleanHsn(w.text) !== null || looksLikeMoney(w.text) || parseQuantityWithUnit(w.text)).map((w) => w.x0)
-  );
-  row.words.forEach((w, i) => {
-    let role = columnOf(w, anchors);
-    if (role === null) {
-      // Past the last heading: an amount under a heading OCR didn't read, or noise.
-      if (looksLikeMoney(w.text) && !hasAmountColumn) role = "amount";
-      else return;
-    }
-    // "Sl." is narrow and centred: only the row's first word, if a small number, is the serial.
-    if (role === "sl" && !(i === 0 && /^\d{1,3}\.?$/.test(w.text))) role = "description";
-    // Long descriptions run past the halfway line into the HSN/Qty columns: words that don't
-    // fit the column's type and sit left of the first real value are description text.
-    if (role !== "description" && role !== "sl" && w.x0 < firstValueX0 && !fitsColumn(role, w.text)) role = "description";
-    (cells[role] ??= []).push(w);
-  });
-  const suspicious = new Set<string>();
-  const descWords = [...(cells.description ?? [])];
-
-  let sl: number | null = null;
-  const slText = (cells.sl ?? []).map((w) => w.text).join("");
-  if (/^\d{1,3}\.?$/.test(slText)) sl = parseInt(slText, 10);
-  else if (descWords.length && /^\d{1,3}\.?$/.test(descWords[0].text) && !anchors.some((a) => a.role === "sl")) {
-    sl = parseInt(descWords.shift()!.text, 10);
-  }
-
-  const hsnWords = cells.hsn ?? [];
-  const hsn = hsnWords.map((w) => cleanHsn(w.text)).find(Boolean) ?? null;
-  const { qty, unit: qtyUnit } = readQty(cells.qty ?? []);
-  const perUnit = (cells.per ?? []).find((w) => isUnit(w.text))?.text.toUpperCase() ?? null;
-
-  const valueWords = [
-    ...hsnWords, ...(cells.qty ?? []), ...(cells.rate ?? []), ...(cells.rateIncl ?? []),
-    ...(cells.taxable ?? []), ...(cells.amount ?? []),
-  ];
-  return {
-    sl,
-    description: descWords.map((w) => w.text).join(" "),
-    hsn,
-    qty,
-    unit: qtyUnit ?? perUnit,
-    rate: readMoney(cells.rate ?? [], "rate", suspicious),
-    rateIncl: readMoney(cells.rateIncl ?? [], "rateIncl", suspicious),
-    taxable: readMoney(cells.taxable ?? [], "taxable", suspicious),
-    amount: readMoney(cells.amount ?? [], "amount", suspicious),
-    gstPct: parsePercent((cells.gstPct ?? []).map((w) => w.text).join("")),
-    suspicious,
-    unlabeledMoney: null,
-    unlabeledWords: null,
-    unlabeledRoles: null,
-    firstValueX: valueWords.length ? Math.min(...valueWords.map((w) => w.x0)) : Infinity,
-  };
-}
-
-/** Read a row by recognising values by their shape (no heading available). */
-function readRowByPattern(row: Row): RawLine {
-  const words = row.words;
-  const suspicious = new Set<string>();
-  let hsnIdx = words.findIndex((w) => /^\d{8}$/.test(cleanHsn(w.text) ?? ""));
-  if (hsnIdx < 0) hsnIdx = words.findIndex((w, i) => i > 0 && cleanHsn(w.text) !== null);
-
-  // Quantity: "2 PCS" (merged by layout) or a number followed by a unit.
-  let qtyIdx = -1;
-  let qty: number | null = null;
-  let unit: string | null = null;
-  for (let i = Math.max(0, hsnIdx + 1); i < words.length; i++) {
-    const q = parseQuantityWithUnit(words[i].text);
-    if (q) {
-      qtyIdx = i;
-      qty = q.value;
-      unit = q.unit;
-      break;
-    }
-  }
-
-  const descEnd = hsnIdx >= 0 ? hsnIdx : qtyIdx >= 0 ? qtyIdx : words.length;
-  const descWords = words.slice(0, descEnd).filter((w) => !looksLikeMoney(w.text));
-  let sl: number | null = null;
-  if (descWords.length && /^\d{1,3}\.?$/.test(descWords[0].text)) sl = parseInt(descWords.shift()!.text, 10);
-
-  const after = words.slice(Math.max(descEnd, qtyIdx + 1));
-  const money: number[] = [];
-  const moneyWords: OcrWord[] = [];
-  let gstPct: number | null = null;
-  for (const w of after) {
-    const pct = parsePercent(w.text);
-    if (pct !== null) {
-      gstPct = pct;
-      continue;
-    }
-    if (!looksLikeMoney(w.text)) continue;
-    const p = parseAmount(w.text);
-    if (p) {
-      money.push(p.value);
-      moneyWords.push(w);
-      if (p.suspicious) suspicious.add("amount");
-    }
-  }
-  if (!unit) unit = after.find((w) => isUnit(w.text))?.text.toUpperCase() ?? null;
-
-  const firstValue = words[hsnIdx >= 0 ? hsnIdx : qtyIdx >= 0 ? qtyIdx : words.length - 1];
-  return {
-    sl,
-    description: descWords.map((w) => w.text).join(" "),
-    hsn: hsnIdx >= 0 ? cleanHsn(words[hsnIdx].text) : null,
-    qty,
-    unit,
-    rate: null,
-    rateIncl: null,
-    taxable: null,
-    amount: null,
-    gstPct,
-    suspicious,
-    unlabeledMoney: money,
-    unlabeledWords: moneyWords,
-    unlabeledRoles: null,
-    firstValueX: firstValue ? firstValue.x0 : Infinity,
-  };
-}
-
-const hasMoney = (r: RawLine) =>
-  r.rate !== null || r.rateIncl !== null || r.taxable !== null || r.amount !== null || (r.unlabeledMoney?.length ?? 0) > 0;
-
-/** Fill gaps in a column-based read with a shape-based read of the same row. */
-function readRow(row: Row, anchors: ColumnAnchor[] | null): RawLine {
-  if (!anchors) return readRowByPattern(row);
-  // Two plain "Rate" headings (the "(incl. of Tax)" line wasn't read): columns can't say
-  // which is which, so read by shape and let the GST ratio decide.
-  const ambiguousRates = anchors.filter((a) => a.role === "rate").length > 1;
-  const byCol = ambiguousRates ? null : readRowByColumns(row, anchors);
-  if (byCol && byCol.qty !== null && hasMoney(byCol) && byCol.hsn !== null) return byCol;
-
-  const byPat = readRowByPattern(row);
-  byPat.unlabeledRoles = (byPat.unlabeledWords ?? []).map((w) => columnOf(w, anchors));
-  if (!byCol) return byPat;
-  if (byPat.qty !== null && (byPat.unlabeledMoney?.length ?? 0) >= 2 && (byCol.qty === null || !hasMoney(byCol))) {
-    return { ...byPat, sl: byCol.sl ?? byPat.sl };
-  }
-  return { ...byCol, hsn: byCol.hsn ?? byPat.hsn, qty: byCol.qty ?? byPat.qty, unit: byCol.unit ?? byPat.unit };
-}
-
-// ---------------------------------------------------------------------------
-// RawLine → BillLine (assign meaning, check arithmetic, fix obvious misreads)
-// ---------------------------------------------------------------------------
-
-/** Unlabeled money values → rate / rate incl / taxable / amount, using arithmetic. */
-function assignByArithmetic(raw: RawLine, flags: string[]): void {
-  const v = raw.unlabeledMoney ?? [];
-  const q = raw.qty;
-  if (v.length === 0) return;
-  if (v.length === 1 || !q) {
-    raw.amount = v[v.length - 1];
-    if (v.length > 1) raw.rate = v[0];
-    flags.push("Could not tell rate from amount — please check.");
-    return;
-  }
-  // Find rate r and amount a with q × r ≈ a. Prefer the rightmost amount.
-  let pair: [number, number] | null = null;
-  for (let j = v.length - 1; j > 0 && !pair; j--)
-    for (let i = j - 1; i >= 0 && !pair; i--) if (amountMatches(q, v[i], v[j])) pair = [i, j];
-
-  if (!pair) {
-    raw.rate = v[0];
-    raw.amount = v[v.length - 1];
-    return; // the arithmetic check below will flag it
-  }
-  const [ri, ai] = pair;
-  raw.rate = v[ri];
-  raw.amount = v[ai];
-  for (let k = 0; k < v.length; k++) {
-    if (k === ri || k === ai) continue;
-    if (inferGstRate(v[k], raw.rate) !== null) raw.rateIncl = v[k];
-    else if (raw.rate !== null && inferGstRate(raw.rate, v[k]) !== null) {
-      // The amount was qty × the tax-inclusive rate; this smaller value is the before-tax rate.
-      raw.rateIncl = raw.rate;
-      raw.rate = v[k];
-    } else if (inferGstRate(v[k], raw.amount) !== null && k > ai) {
-      // Amount column includes tax; the earlier one was the taxable value.
-      raw.taxable = raw.amount;
-      raw.amount = v[k];
-    }
-  }
-  // Only one rate, sitting under a "Rate (incl. of Tax)" heading.
-  if (raw.rateIncl === null && raw.unlabeledRoles?.[ri] === "rateIncl") {
-    raw.rateIncl = raw.rate;
-    raw.rate = null;
-  }
-}
-
-function resolveLine(raw: RawLine, index: number): BillLine {
-  const flags: string[] = [];
-  const autoFixed: string[] = [];
-  const uncertain = new Set<string>(raw.suspicious);
-
-  if (raw.unlabeledMoney) assignByArithmetic(raw, flags);
-
-  const q = raw.qty;
-  let rate = raw.rate;
-  let rateIncl = raw.rateIncl;
-  let taxable = raw.taxable;
-  let amount = raw.amount;
-  let gst = raw.gstPct;
-  let amountIncludesTax: boolean | null = null;
-  const verified = new Set<string>();
-
-  if (q !== null && q > 0) {
-    // --- Layout with a separate "Taxable" column: Rate × Qty = Taxable, Taxable + GST = Amount ---
-    if (taxable !== null) {
-      // A misread GST % ("8%" for "18%") must not "correct" a good amount: if amount ÷ taxable
-      // is a real GST rate and differs from the printed one, the printed % is the misread.
-      const gFromAmount = amount !== null ? inferGstRate(amount, taxable) : null;
-      if (gFromAmount !== null && gFromAmount !== gst) {
-        if (gst !== null) autoFixed.push(`GST ${gst}% → ${gFromAmount}% (amount ÷ taxable)`);
-        gst = gFromAmount;
-      } else if (gst !== null && !GST_SLABS.includes(gst)) {
-        flags.push(`GST ${gst}% is not a GST rate`);
-        uncertain.add("gst");
-      }
-      const g = gst;
-      const withTax = (t: number) => round2(t * (1 + (g ?? 0) / 100));
-      const rateOk = rate !== null && amountMatches(q, rate, taxable);
-      const amountOk = g !== null && amount !== null && totalsMatch(withTax(taxable), amount);
-      if (rateOk) verified.add("rate").add("taxable");
-      if (amountOk) verified.add("taxable").add("amount");
-
-      if (rateOk && !amountOk && g !== null && amount !== null) {
-        autoFixed.push(`amount ${formatINR(amount)} → ${formatINR(withTax(taxable))} (taxable + ${g}% GST)`);
-        amount = withTax(taxable);
-        verified.add("amount");
-      } else if (!rateOk && amountOk && rate !== null) {
-        const fixedRate = round2(taxable / q);
-        autoFixed.push(`rate ${formatINR(rate)} → ${formatINR(fixedRate)} (taxable ÷ qty)`);
-        rate = fixedRate;
-        verified.add("rate");
-      } else if (!rateOk && !amountOk && rate !== null && g !== null && amount !== null && totalsMatch(withTax(round2(q * rate)), amount)) {
-        autoFixed.push(`taxable ${formatINR(taxable)} → ${formatINR(round2(q * rate))} (qty × rate)`);
-        taxable = round2(q * rate);
-        verified.add("rate").add("taxable").add("amount");
-      } else if (!rateOk && !amountOk) {
-        flags.push("qty × rate ≠ taxable, and taxable + GST ≠ amount");
-        uncertain.add("rate").add("taxable").add("amount");
-      }
-      if (amount !== null) amountIncludesTax = true;
-    }
-    // --- Tally layout: Rate, Rate (incl. of Tax), Amount ---
-    else if (amount !== null) {
-      const gstFromRates = rate !== null && rateIncl !== null ? inferGstRate(rateIncl, rate) : null;
-      if (rate !== null && amountMatches(q, rate, amount)) {
-        amountIncludesTax = false;
-        verified.add("rate").add("amount");
-        if (rateIncl !== null && gstFromRates !== null) verified.add("rateIncl");
-      } else if (rateIncl !== null && amountMatches(q, rateIncl, amount)) {
-        amountIncludesTax = true;
-        verified.add("rateIncl").add("amount");
-      } else if (rate !== null && rateIncl !== null) {
-        // One of the three was misread. Which two agree?
-        const rateFromAmount = round2(amount / q);
-        if (inferGstRate(rateIncl, rateFromAmount) !== null) {
-          autoFixed.push(`rate ${formatINR(rate)} → ${formatINR(rateFromAmount)} (amount ÷ qty)`);
-          rate = rateFromAmount;
-          amountIncludesTax = false;
-          verified.add("rate").add("amount").add("rateIncl");
-        } else if (gstFromRates !== null) {
-          const fixedAmount = round2(q * rate);
-          autoFixed.push(`amount ${formatINR(amount)} → ${formatINR(fixedAmount)} (qty × rate)`);
-          amount = fixedAmount;
-          amountIncludesTax = false;
-          verified.add("rate").add("amount").add("rateIncl");
-        }
-      }
-      if (!verified.has("amount")) {
-        flags.push("qty × rate ≠ amount");
-        uncertain.add("amount");
-        if (rate !== null) uncertain.add("rate");
-        if (rateIncl !== null) uncertain.add("rateIncl");
-      }
-    }
-  }
-
-  if (rate !== null && rateIncl !== null) {
-    const g = inferGstRate(rateIncl, rate);
-    if (g === null) {
-      flags.push("rate incl. tax doesn't match any GST rate");
-      uncertain.add("rateIncl");
-    } else gst ??= g;
-  }
-  if (gst !== null && rate !== null && rateIncl === null) rateIncl = round2(rate * (1 + gst / 100));
-
-  if (q === null) {
-    flags.push("Quantity not read");
-    uncertain.add("quantity");
-  }
-  if (amount === null) {
-    flags.push("Amount not read");
-    uncertain.add("amount");
-  }
-  if (!raw.hsn) {
-    flags.push("HSN not read");
-    uncertain.add("hsn");
-  }
-  if (!raw.description.trim()) {
-    flags.push("Description not read");
-    uncertain.add("description");
-  }
-  for (const f of Array.from(uncertain)) if (verified.has(f)) uncertain.delete(f);
-
-  const taxableValue =
-    taxable ??
-    (amountIncludesTax === false ? amount : null) ??
-    (q !== null && rate !== null ? round2(q * rate) : null);
-
-  const description = raw.description.replace(/\s+/g, " ").replace(/^[|:.\-\s]+|[|:\-\s]+$/g, "");
-  return {
-    lineNo: raw.sl ?? index + 1,
-    description,
-    hsn: raw.hsn,
-    quantity: q,
-    unit: raw.unit,
-    rateExclTax: rate,
-    rateInclTax: rateIncl,
-    gstRate: gst,
-    amount,
-    amountIncludesTax,
-    taxableValue,
-    hints: productHints(description),
-    flags,
-    uncertainFields: Array.from(new Set(Array.from(uncertain).map((f) => FIELD_NAMES[f] ?? f))),
-    autoFixed,
-  };
+  y: number;
 }
 
 /** Internal field → bill_lines column name. */
@@ -461,6 +74,37 @@ const FIELD_NAMES: Record<string, string> = {
   description: "raw_description",
 };
 
+function toLine(item: Item, sol: LineSolution, index: number): BillLine {
+  const flags = [...sol.flags];
+  const uncertain = new Set(sol.uncertain);
+  const description = item.description.replace(/\s+/g, " ").replace(/^[|:.\-\s[\]]+|[|:\-\s[\]]+$/g, "");
+  if (!item.row.hsn) {
+    flags.push("HSN not read");
+    uncertain.add("hsn");
+  }
+  if (!description) {
+    flags.push("Description not read");
+    uncertain.add("description");
+  }
+  return {
+    lineNo: item.row.sl ?? index + 1,
+    description,
+    hsn: item.row.hsn,
+    quantity: sol.quantity,
+    unit: item.row.unit,
+    rateExclTax: sol.rateExclTax,
+    rateInclTax: sol.rateInclTax,
+    gstRate: sol.gstRate,
+    amount: sol.amount,
+    amountIncludesTax: sol.amountIncludesTax,
+    taxableValue: sol.taxableValue,
+    hints: productHints(description),
+    flags,
+    uncertainFields: Array.from(new Set(Array.from(uncertain).map((f) => FIELD_NAMES[f] ?? f))),
+    autoFixed: sol.autoFixed,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Totals
 // ---------------------------------------------------------------------------
@@ -468,6 +112,16 @@ const FIELD_NAMES: Record<string, string> = {
 interface MoneyRead {
   value: number;
   raw: string;
+}
+
+function moneyOf(text: string): MoneyRead | null {
+  const clean = text.replace(/[()]/g, "");
+  if (looksLikeMoney(clean) || /^\(?-\)?\s*\d+\.\d{2}$/.test(text)) {
+    const v = parseAmount(clean.replace(/^-/, ""))?.value;
+    if (v !== undefined && Number.isFinite(v)) return { value: v, raw: text };
+  }
+  const loose = parseLooseMoney(text);
+  return loose && loose.quality >= 0.8 ? { value: loose.value, raw: text } : null;
 }
 
 function readTotals(rows: Row[]): { totals: BillTotals; unlabeled: MoneyRead[] } {
@@ -480,28 +134,35 @@ function readTotals(rows: Row[]): { totals: BillTotals; unlabeled: MoneyRead[] }
 
   for (let index = 0; index < rows.length; index++) {
     const row = rows[index];
-    const text = rowText(row).toLowerCase();
-    if (/in\s*words|chargeable/.test(text)) continue;
-    const money: MoneyRead[] = row.words
-      .filter((w) => looksLikeMoney(w.text) || /^\(?-\)?\s*\d+\.\d{2}$/.test(w.text))
-      .map((w) => ({ value: parseAmount(w.text.replace(/[()]/g, ""))?.value ?? NaN, raw: w.text }))
-      .filter((m) => Number.isFinite(m.value));
+    const text = labelText(rowText(row));
+    // The HSN-wise tax summary below "Amount Chargeable (in words)" repeats the totals
+    // in a different layout — stop before it.
+    if (/in ?words|chargeable/.test(text)) break;
+    const money: MoneyRead[] = [];
+    row.words.forEach((w, i) => {
+      if (/^(₹|rs\.?)$/i.test(w.text)) return;
+      const m = moneyOf(w.text);
+      if (m) money.push({ ...m, raw: (row.words[i - 1] && /^(₹|rs\.?)$/i.test(row.words[i - 1].text) ? "₹" : "") + m.raw });
+    });
     const qtyWord = row.words.map((w) => parseQuantityWithUnit(w.text)).find(Boolean);
     if (qtyWord && /total/.test(text)) totals.totalQuantity = qtyWord.value;
     if (money.length === 0) continue;
     const last = money[money.length - 1];
 
-    const isTax = /cgst|sgst|utgst|igst/.test(text) || !/[a-z]{3}/.test(text);
+    const isTax = /cgst|sgst|sgsy|utgst|igst/.test(text) || !/[a-z]{3}/.test(text);
     if (isTax) firstTaxIndex = Math.min(firstTaxIndex, index);
 
-    if (/round/.test(text)) totals.roundOff = /\(-\)|-\s*\d|less/.test(text) ? -Math.abs(last.value) : last.value;
+    if (/round|coin ?adj/.test(text)) totals.roundOff = /\(-\)|-\s*\d|less/.test(text) ? -Math.abs(last.value) : last.value;
     else if (/cgst/.test(text)) totals.cgst = last.value;
-    else if (/sgst|utgst/.test(text)) totals.sgst = last.value;
+    else if (/sgst|sgsy|utgst/.test(text)) totals.sgst = last.value;
     else if (/igst/.test(text)) totals.igst = last.value;
     else if (/taxable/.test(text)) totals.subtotal = last.value;
     else if (/grand/.test(text)) totals.grandTotal = last.value;
-    else if (/total/.test(text)) totalRows.push({ ...last, index, hasQty: Boolean(qtyWord) });
-    else if (!/[a-z]{3}/.test(text)) unlabeled.push(last);
+    else if (/total/.test(text)) {
+      // "Total 6 pcs ₹ 89,000.00 75,423.72 6,788.13 …": the ₹ figure (or the largest) is the total.
+      const main = money.find((m) => m.raw.startsWith("₹")) ?? money.reduce((a, b) => (b.value > a.value ? b : a));
+      totalRows.push({ ...main, index, hasQty: Boolean(qtyWord) });
+    } else if (!/[a-z]{3}/.test(text)) unlabeled.push(last);
   }
 
   // Tally prints "Total <qty> <sub-total>" above the tax lines, then "Total ₹ <grand total>" below them.
@@ -530,78 +191,131 @@ function withoutRupeeMisread(m: MoneyRead | number, expected: number): number | 
 // Main
 // ---------------------------------------------------------------------------
 
-export function parseBill(pages: OcrPage[]): ParsedBill {
+export type ParseOptions = HeaderOptions;
+
+export function parseBill(pages: OcrPage[], options: ParseOptions = {}): ParsedBill {
   const warnings: string[] = [];
-  const lines: BillLine[] = [];
+  const items: Item[] = [];
+  const solutions: LineSolution[] = [];
   let columns: ColumnAnchor[] = [];
   let headerResult: ReturnType<typeof readHeader> | null = null;
   let totals: BillTotals | null = null;
   let unlabeledTotals: MoneyRead[] = [];
   let orphanSubtotal: number | null = null;
+  let continued = false;
+  const tableRegions: ParsedBill["tableRegions"] = [];
 
   for (let pageIndex = 0; pageIndex < pages.length; pageIndex++) {
     const page = pages[pageIndex];
-    const words = cleanWords(page.words);
-    const h = medianHeight(words);
+    const cleaned = cleanWords(page.words);
+    const h = medianHeight(cleaned);
+    const words = page.source === "ocr" ? straighten(cleaned, h).words : cleaned;
+    const originalOf = new Map<OcrWord, OcrWord>(words.map((w, i) => [w, cleaned[i]]));
     const rows = groupRows(words, h);
-    if (pageIndex === 0) headerResult = readHeader(rows, h);
+    if (pageIndex === 0) headerResult = readHeader(rows, h, options);
+    if (rows.some((r) => /continued/.test(labelText(rowText(r))))) continued = true;
 
     const header = findHeader(rows, h);
     if (header) columns = header.anchors;
-    else warnings.push(`Page ${pageIndex + 1}: item table heading not found — reading rows by pattern.`);
-
     const anchors = header ? withDescriptionColumn(header.anchors, h) : null;
-    const start = header ? header.index + header.rowCount : 0;
+    let start = header ? header.index + header.rowCount : rows.findIndex(looksLikeItemRow);
+    if (!header) {
+      warnings.push(`Page ${pageIndex + 1}: item table heading not found — reading rows by pattern.`);
+      if (start < 0) start = rows.length;
+      // The first item may have a damaged HSN: look back a few rows for item-like rows.
+      for (let k = start - 1; k >= 0 && k >= start - 3; k--) {
+        if (readItemRow(rows[k], null, h).kind !== "item") break;
+        start = k;
+      }
+    }
     let end = rows.length;
     for (let i = start; i < rows.length; i++) {
-      const first = rows[i].words[0]?.text ?? "";
-      const hasHsn = rows[i].words.some((w) => cleanHsn(w.text)?.length === 8);
-      if (FOOTER_START.test(first) && !hasHsn) {
+      if (isFooterRow(rows[i])) {
         end = i;
         break;
       }
     }
 
-    let lastItem: { raw: RawLine; rowY: number } | null = null;
-    const raws: RawLine[] = [];
+    // Where the table sits (heading → end of the totals), in the page's own coordinates.
+    const itemsBefore = items.length;
+    const regionStart = header ? header.index : start;
+
+    let last: Item | null = null;
     for (let i = start; i < end; i++) {
-      const row = rows[i];
-      const raw = readRow(row, anchors);
-      const isItem = raw.qty !== null && hasMoney(raw);
-      const isItemNoQty = raw.hsn !== null && hasMoney(raw);
-      if (isItem || isItemNoQty) {
-        raws.push(raw);
-        lastItem = { raw, rowY: row.y };
+      const r = readItemRow(rows[i], anchors, h);
+      if (r.kind === "item") {
+        last = { row: r, description: r.description, y: r.y };
+        items.push(last);
         continue;
       }
-      const textOnly = !hasMoney(raw) && raw.qty === null && raw.hsn === null && raw.description.trim().length > 0;
-      const inDescArea = row.words.every((w) => centerX(w) < (lastItem?.raw.firstValueX ?? Infinity));
-      if (lastItem && textOnly && inDescArea && row.y - lastItem.rowY < h * 3.5) {
-        lastItem.raw.description += " " + raw.description;
-        lastItem.rowY = row.y;
-      } else if (!textOnly && hasMoney(raw) && raw.qty === null && raw.hsn === null && !/[a-z]{3}/i.test(raw.description)) {
+      if (r.kind === "text" && last && r.y - last.y < h * 3.5) {
+        const inDescArea = rows[i].words.every((w) => w.x0 < (last as Item).row.firstValueX);
+        if (inDescArea) {
+          last.description += " " + r.description;
+          last.y = r.y;
+        }
+      } else if (r.kind === "batch" && last) {
+        last.y = r.y; // keep description continuations below batch lines attached
+      } else if (r.kind === "money" && items.length > 0) {
         // A money-only row after the items (Tally prints the sub-total like this).
-        const vals = raw.unlabeledMoney ?? [raw.amount, raw.taxable].filter((x): x is number => x !== null);
-        if (vals.length) orphanSubtotal = vals[vals.length - 1];
+        const best = r.obs.values.reduce((a, b) => (b.quality > a.quality || (b.quality === a.quality && b.value > a.value) ? b : a));
+        if (best.quality >= 0.8) orphanSubtotal = best.value;
       }
     }
-    for (const raw of raws) lines.push(resolveLine(raw, lines.length));
 
     if (end < rows.length) {
       const t = readTotals(rows.slice(end));
       totals = t.totals;
       unlabeledTotals = t.unlabeled;
     }
+
+    if (items.length > itemsBefore && regionStart < rows.length) {
+      let regionEnd = rows.findIndex((r, i) => i >= end && /in ?words|chargeable|continued/.test(labelText(rowText(r))));
+      if (regionEnd < 0) regionEnd = Math.min(rows.length - 1, end + 8);
+      const orig = (r: Row) => r.words.map((w) => originalOf.get(w) ?? w);
+      const ys = rows.slice(regionStart, regionEnd + 1).flatMap(orig).flatMap((w) => [w.y0, w.y1]);
+      const footerTop = end < rows.length ? Math.min(...orig(rows[end]).map((w) => (w.y0 + w.y1) / 2)) : Math.max(...ys);
+      tableRegions.push({ page: pageIndex, y0: Math.min(...ys), y1: Math.max(...ys), itemsEnd: footerTop });
+    }
   }
+
+  for (const item of items) solutions.push(solveLine(item.row.obs));
 
   const finalTotals: BillTotals = totals ?? {
     totalQuantity: null, subtotal: null, cgst: null, sgst: null, igst: null, roundOff: null, grandTotal: null,
   };
-  if (finalTotals.subtotal === null && orphanSubtotal !== null) finalTotals.subtotal = orphanSubtotal;
+  if (finalTotals.subtotal === null && orphanSubtotal !== null) {
+    // A money-only row under the items is the sub-total only if it is in the right range
+    // (a half-read "3,99,491.47" → "491.47" is not).
+    // Compare with the lines whose numbers agreed (a misread line would skew the sum).
+    const strong = solutions.filter((s) => s.taxableValue !== null && s.support >= 2 && !s.estimated);
+    const sumStrong = strong.reduce((a, s) => a + (s.taxableValue ?? 0), 0);
+    const allStrong = strong.length === solutions.length;
+    const plausible =
+      strong.length === 0 ||
+      (allStrong
+        ? Math.abs(orphanSubtotal - sumStrong) <= sumStrong * 0.2
+        : orphanSubtotal >= sumStrong - 1 && orphanSubtotal <= sumStrong * 2);
+    if (plausible) finalTotals.subtotal = orphanSubtotal;
+  }
+
+  fillFromBill(solutions, finalTotals);
+  const lines = items.map((item, i) => toLine(item, solutions[i], i));
+  // Serial numbers: keep the printed ones if they only go up. If they jump around (a margin
+  // tick read as "20"), number the lines by the offset most of them agree on.
+  const sls = items.map((it) => it.row.sl);
+  const increasing = sls.every((s, i) => s !== null && (i === 0 || s > (sls[i - 1] as number)));
+  if (!increasing) {
+    const offsets = new Map<number, number>();
+    sls.forEach((s, i) => s !== null && offsets.set(s - i, (offsets.get(s - i) ?? 0) + 1));
+    const offset = Array.from(offsets.entries()).sort((a, b) => b[1] - a[1] || a[0] - b[0])[0]?.[0] ?? 1;
+    lines.forEach((l, i) => (l.lineNo = i + Math.max(1, offset)));
+  }
 
   const checks = crossCheck(lines, finalTotals, unlabeledTotals, warnings);
   const hr = headerResult;
   if (hr) warnings.unshift(...hr.warnings);
+  if (continued) warnings.push('Bill says "continued to next page" — add the next page as well.');
   if (lines.length === 0) warnings.push("No item lines found.");
 
   return {
@@ -620,9 +334,71 @@ export function parseBill(pages: OcrPage[]): ParsedBill {
     checks,
     warnings,
     columns,
+    tableRegions,
     pageCount: pages.length,
     source: pages[0]?.source ?? "ocr",
   };
+}
+
+/**
+ * Fixes that need the whole bill:
+ *  - a line whose GST rate couldn't be proven takes the rate the other lines agree on;
+ *  - one line that couldn't be read is the sub-total minus all the other lines.
+ */
+function fillFromBill(sols: LineSolution[], totals: BillTotals): void {
+  const counts = new Map<number, number>();
+  for (const s of sols) if (s.gstFromLine && s.gstRate !== null) counts.set(s.gstRate, (counts.get(s.gstRate) ?? 0) + 1);
+  const majority = Array.from(counts.entries()).sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
+
+  if (majority !== null) {
+    for (const s of sols) {
+      if (s.gstRate !== null) continue;
+      if (s.rateExclTax !== null && s.rateInclTax === null) {
+        s.gstRate = majority;
+        s.rateInclTax = round2(s.rateExclTax * (1 + majority / 100));
+      } else if (s.rateInclTax !== null && s.rateExclTax === null && s.quantity) {
+        s.gstRate = majority;
+        s.rateExclTax = round2(s.rateInclTax / (1 + majority / 100));
+        s.taxableValue = round2((s.quantity * s.rateInclTax) / (1 + majority / 100));
+      }
+    }
+  }
+
+  // One weak line + a known sub-total → that line is the difference.
+  const subtotal = totals.subtotal;
+  const weak = sols.filter((s) => s.support <= 1 || s.taxableValue === null || s.estimated);
+  if (subtotal !== null && weak.length === 1 && sols.length > 1) {
+    const w = weak[0];
+    const others = sols.filter((s) => s !== w);
+    if (others.every((s) => s.taxableValue !== null)) {
+      const rest = round2(subtotal - others.reduce((a, s) => a + (s.taxableValue ?? 0), 0));
+      const g = w.gstRate ?? majority;
+      if (rest > 0 && w.quantity && (w.taxableValue === null || Math.abs(rest - w.taxableValue) > 0.009)) {
+        const before = w.taxableValue;
+        w.taxableValue = rest;
+        w.rateExclTax = round2(rest / w.quantity);
+        if (g !== null) {
+          w.gstRate = g;
+          w.rateInclTax = round2(w.rateExclTax * (1 + g / 100));
+        }
+        if (!w.amountIncludesTax) w.amount = rest;
+        else if (g !== null) w.amount = round2(rest * (1 + g / 100));
+        w.autoFixed.push(
+          before === null
+            ? `amount ${formatINR(rest)} = sub-total − other lines`
+            : `amount ${formatINR(before)} → ${formatINR(rest)} (sub-total − other lines)`
+        );
+        w.flags = w.flags.filter((f) => !/one number|don't agree|worked out/.test(f));
+        w.uncertain = w.uncertain.filter((f) => f !== "amount" && f !== "rate" && f !== "rateIncl");
+        w.estimated = false;
+      } else if (w.taxableValue !== null && Math.abs(rest - w.taxableValue) <= 0.009) {
+        // The sub-total confirms the weak line.
+        w.flags = w.flags.filter((f) => !/one number|don't agree|worked out/.test(f));
+        w.uncertain = w.uncertain.filter((f) => f !== "amount" && f !== "rate" && f !== "rateIncl");
+        w.estimated = false;
+      }
+    }
+  }
 }
 
 /** If the heading had no readable "Description", assume the space left of the first value column. */

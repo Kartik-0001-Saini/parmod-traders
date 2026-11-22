@@ -10,8 +10,10 @@
  * Both steps are platform-neutral: the caller supplies an OcrEngine (Node: sharp →
  * PNG → Tesseract; browser: canvas → Tesseract).
  */
-import { GrayImage, QuarterTurn, resize, rotate } from "./image";
+import { GrayImage, QuarterTurn, crop, resize, rotate } from "./image";
 import { OcrPage, OcrWord } from "./types";
+
+export type { OcrWord };
 
 export interface OcrEngine {
   recognize(img: GrayImage, onProgress?: (fraction: number) => void): Promise<OcrPage>;
@@ -29,6 +31,8 @@ export interface PageReadInfo {
 
 export interface PreparedImage {
   image: GrayImage;
+  /** The photo turned the right way up, at its own resolution (for the zoomed table read). */
+  turned: GrayImage;
   info: PageReadInfo;
   /** OCR result from the orientation check, reused when it was already at the final size. */
   reusable: OcrPage | null;
@@ -96,6 +100,7 @@ export async function prepareImage(original: GrayImage, engine: OcrEngine, cb: S
   cb.onProgress?.(1);
   return {
     image: reuse ? rotate(probeBase, best) : resize(turned, scale),
+    turned,
     info: { rotation: best, scale: reuse ? probeScale : scale, textHeight, orientationScores: scores },
     reusable: reuse ? probe : null,
   };
@@ -108,4 +113,49 @@ export async function extractText(prepared: PreparedImage, engine: OcrEngine, cb
   }
   cb.onStatus?.("Reading the text");
   return engine.recognize(prepared.image, cb.onProgress);
+}
+
+/** Text height for the zoomed table read (px). Bigger than the page read: table text is the smallest. */
+const ZOOM_TEXT_HEIGHT = 36;
+const MAX_ZOOM_SCALE = 5;
+
+export interface ZoomedRead {
+  /** Words of the zoomed strip, in page coordinates. */
+  words: OcrWord[];
+  /** The strip's top and bottom, in page coordinates. */
+  top: number;
+  bottom: number;
+}
+
+/**
+ * Read the item table again, cut out and enlarged. On phone photos the table text is
+ * the smallest on the page; reading just that strip bigger fixes many misread numbers
+ * (and sometimes damages others — the caller keeps whichever read checks out better).
+ */
+export async function zoomTable(
+  prepared: PreparedImage,
+  page: OcrPage,
+  region: { y0: number; y1: number },
+  engine: OcrEngine,
+  cb: StepCallbacks = {}
+): Promise<ZoomedRead | null> {
+  const s = prepared.info.scale;
+  const inRegion = page.words.filter((w) => (w.y0 + w.y1) / 2 >= region.y0 && (w.y0 + w.y1) / 2 <= region.y1);
+  const heights = inRegion.filter((w) => w.conf >= 50 && /[A-Za-z0-9]{2,}/.test(w.text)).map((w) => w.y1 - w.y0).sort((a, b) => a - b);
+  if (heights.length < 10) return null;
+  const tableText = heights[Math.floor(heights.length / 2)] / s; // in the original photo
+  const margin = tableText * 2;
+  const y0 = Math.max(0, region.y0 / s - margin);
+  const y1 = Math.min(prepared.turned.height, region.y1 / s + margin);
+  let zoom = Math.min(MAX_ZOOM_SCALE, ZOOM_TEXT_HEIGHT / tableText);
+  zoom = Math.min(zoom, Math.sqrt(MAX_PIXELS / (prepared.turned.width * (y1 - y0))));
+  // Only worth it if the table gets noticeably bigger than in the page read.
+  if (zoom < s * 1.25) return null;
+
+  cb.onStatus?.("Zooming in on the item table");
+  const strip = resize(crop(prepared.turned, 0, y0, prepared.turned.width, y1), zoom);
+  const read = await engine.recognize(strip, cb.onProgress);
+  const k = s / zoom; // zoomed strip → page coordinates
+  const words = read.words.map((w) => ({ ...w, x0: w.x0 * k, x1: w.x1 * k, y0: (w.y0 / zoom + y0) * s, y1: (w.y1 / zoom + y0) * s }));
+  return { words, top: y0 * s, bottom: y1 * s };
 }

@@ -28,7 +28,8 @@ import {
 interface BillUploadModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onBillUploaded: (bill: BillRecord) => void;
+  /** The bill was saved; `files` are its pages (so the reader can start without downloading them). */
+  onBillUploaded: (bill: BillRecord, files: { blob: Blob; name: string }[]) => void;
 }
 
 interface PageItem {
@@ -221,7 +222,10 @@ export function BillUploadModal({
         return;
       }
 
-      onBillUploaded(result.bill);
+      onBillUploaded(
+        result.bill,
+        filesToUpload.map((f) => ({ blob: f, name: f.name }))
+      );
       onClose();
     } catch (err: any) {
       setErrorMsg(err?.message || "An unexpected error occurred during upload");
@@ -397,11 +401,11 @@ export function BillUploadModal({
             <Sparkles className="w-4 h-4 shrink-0 text-indigo-600 mt-0.5" />
             <div>
               <span className="font-bold">
-                {isHindi ? "सप्लायर और इनवॉइस अपने आप पढ़ा जाएगा:" : "Automatic Supplier Detection:"}
+                {isHindi ? "अपलोड के बाद बिल अपने आप पढ़ा जाएगा:" : "The bill is read right after upload:"}
               </span>{" "}
               {isHindi
-                ? "सप्लायर का नाम (जैसे Jindal Electronics) और GSTIN बिल पढ़ते समय AI खुद निकाल लेगा। आप चाहें तो नीचे भर सकते हैं।"
-                : "Distributor name and GSTIN are automatically extracted by AI from the invoice header. You may also enter them manually below."}
+                ? "सप्लायर, GSTIN, इनवॉइस नंबर और सारे आइटम फोन पर ही पढ़े जाते हैं। सबसे अच्छे नतीजे: बिल समतल रखें, पूरी टेबल दिखे, कैमरा सीधा ऊपर — WhatsApp से भेजी फोटो की जगह असली फोटो या PDF।"
+                : "Supplier, GSTIN, invoice no. and every item are read on this phone. Best results: bill flat, whole table in view, camera straight above — the original photo or PDF rather than a WhatsApp-forwarded one."}
             </div>
           </div>
 

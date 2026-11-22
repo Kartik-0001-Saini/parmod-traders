@@ -392,7 +392,7 @@ export async function getBillSignedUrlsForPages(
 }
 
 /**
- * Allows deleting an unconfirmed bill and its storage files.
+ * Allows deleting a bill that is not yet in stock (uploaded, read, or rejected) and its storage files.
  */
 export async function deleteBillRecord(
   billId: string,
@@ -409,7 +409,7 @@ export async function deleteBillRecord(
       .from("bills")
       .delete()
       .eq("id", billId)
-      .in("status", ["uploaded", "rejected"]);
+      .neq("status", "confirmed");
 
     if (dbError) {
       return { success: false, error: dbError.message };

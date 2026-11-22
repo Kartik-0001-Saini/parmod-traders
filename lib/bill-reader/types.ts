@@ -39,7 +39,10 @@ export type ColumnRole =
   | "per"
   | "taxable" // qty × rate before tax
   | "gstPct"
-  | "amount";
+  | "amount"
+  | "tax" // CGST / SGST / IGST amount on the line
+  | "total" // line total including tax
+  | "disc"; // discount %
 
 export interface ColumnAnchor {
   role: ColumnRole;
@@ -132,6 +135,8 @@ export interface ParsedBill {
   warnings: string[];
   /** Columns detected from the table heading (useful when debugging a bill). */
   columns: ColumnAnchor[];
+  /** Where the item table sits on each page (page coordinates), for a zoomed second read. */
+  tableRegions: { page: number; y0: number; y1: number; itemsEnd: number }[];
   pageCount: number;
   source: OcrPage["source"];
 }

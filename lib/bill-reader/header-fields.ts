@@ -22,20 +22,66 @@ export function gstinChecksumOk(gstin: string): boolean {
   return GSTIN_CHARS[(36 - (sum % 36)) % 36] === gstin[14];
 }
 
-/** Fix common OCR swaps by position (digits vs letters), then validate the shape. */
+/** Letters OCR reads in place of a digit, and the digits they could be. */
+const AS_DIGIT: Record<string, string[]> = {
+  O: ["0"], D: ["0"], Q: ["0"], U: ["0"], I: ["1"], L: ["1"], T: ["7", "1"], Z: ["2"], S: ["5"], B: ["8"], G: ["6"], E: ["6", "8"], A: ["4"],
+};
+/** Digits OCR reads in place of a letter, and the letters they could be. */
+const AS_LETTER: Record<string, string[]> = {
+  "0": ["O", "D", "Q"], "1": ["I", "L"], "2": ["Z"], "4": ["A"], "5": ["S"], "6": ["G"], "7": ["T"], "8": ["B"],
+};
+
+/**
+ * Fix OCR swaps by position (digits vs letters). Where a character could be more than
+ * one thing ("T" = 7 or 1), the variant whose check digit is right wins; otherwise the
+ * first variant with the right shape is returned (and fails the checksum warning later).
+ */
 export function normalizeGstin(candidate: string): string | null {
   const c = candidate.toUpperCase().replace(/[^A-Z0-9]/g, "");
   if (c.length !== 15) return null;
-  const toDigit: Record<string, string> = { O: "0", D: "0", I: "1", L: "1", S: "5", B: "8", Z: "2", G: "6" };
-  const toLetter: Record<string, string> = { "0": "O", "1": "I", "5": "S", "8": "B", "2": "Z", "6": "G" };
-  const digitPos = [0, 1, 7, 8, 9, 10];
-  const letterPos = [2, 3, 4, 5, 6, 11];
-  const chars = c.split("");
-  for (const i of digitPos) chars[i] = toDigit[chars[i]] ?? chars[i];
-  for (const i of letterPos) chars[i] = toLetter[chars[i]] ?? chars[i];
-  if (chars[13] === "2") chars[13] = "Z";
-  const fixed = chars.join("");
-  return GSTIN_PATTERN.test(fixed) ? fixed : null;
+  const digitPos = new Set([0, 1, 7, 8, 9, 10]);
+  const letterPos = new Set([2, 3, 4, 5, 6, 11]);
+  const options: string[][] = c.split("").map((ch, i) => {
+    if (digitPos.has(i) && /[A-Z]/.test(ch)) return AS_DIGIT[ch] ?? [ch];
+    if (letterPos.has(i) && /\d/.test(ch)) return AS_LETTER[ch] ?? [ch];
+    if (i === 13 && ch === "2") return ["Z"];
+    return [ch];
+  });
+  const combos = options.reduce((n, o) => n * o.length, 1);
+  if (combos > 512) return null;
+  let firstShape: string | null = null;
+  const walk = (i: number, acc: string): string | null => {
+    if (i === 15) {
+      if (!GSTIN_PATTERN.test(acc)) return null;
+      firstShape ??= acc;
+      return gstinChecksumOk(acc) ? acc : null;
+    }
+    for (const ch of options[i]) {
+      const r = walk(i + 1, acc + ch);
+      if (r) return r;
+    }
+    return null;
+  };
+  return walk(0, "") ?? firstShape;
+}
+
+/** Number of positions where two GSTIN-length strings differ. */
+function gstinDistance(a: string, b: string): number {
+  let d = 0;
+  for (let i = 0; i < 15; i++) if (a[i] !== b[i]) d++;
+  return d;
+}
+
+export interface KnownSupplier {
+  name: string;
+  gstin: string | null;
+}
+
+export interface HeaderOptions {
+  /** The shop's own GSTIN: always the buyer, never the supplier. */
+  ownGstin?: string | null;
+  /** Suppliers already in the app: recognised from a partly read GSTIN or their name. */
+  knownSuppliers?: KnownSupplier[];
 }
 
 interface FoundGstin {
@@ -46,22 +92,33 @@ interface FoundGstin {
 
 function findGstins(rows: Row[]): FoundGstin[] {
   const found: FoundGstin[] = [];
-  rows.forEach((row, rowIndex) => {
-    for (const w of row.words) {
-      const compact = w.text.toUpperCase().replace(/[^A-Z0-9]/g, "");
-      // Skip long tokens (the 64-char IRN) so a random slice can't pass as a GSTIN.
-      if (compact.length > 26) continue;
-      // The GSTIN may be glued to its label: "GSTIN/UIN:06AAAFJ7674N1ZF".
-      for (let start = 0; start + 15 <= compact.length; start++) {
-        const g = normalizeGstin(compact.slice(start, start + 15));
-        if (g && !found.some((f) => f.gstin === g)) {
-          found.push({ gstin: g, rowIndex, word: w });
-          break;
-        }
+  const tryText = (text: string, rowIndex: number, w: OcrWord) => {
+    const compact = text.toUpperCase().replace(/[^A-Z0-9]/g, "");
+    // Skip long tokens (the 64-char IRN) so a random slice can't pass as a GSTIN.
+    if (compact.length > 26 || compact.length < 15) return false;
+    // The GSTIN may be glued to its label: "GSTIN/UIN:06AAAFJ7674N1ZF".
+    for (let start = 0; start + 15 <= compact.length; start++) {
+      const slice = compact.slice(start, start + 15);
+      if (!/^[0O]?\d/.test(slice) && !/^\d/.test(slice)) continue;
+      const g = normalizeGstin(slice);
+      if (g && !found.some((f) => f.gstin === g)) {
+        found.push({ gstin: g, rowIndex, word: w });
+        return true;
       }
     }
+    return false;
+  };
+  rows.forEach((row, rowIndex) => {
+    row.words.forEach((w, i) => {
+      if (tryText(w.text, rowIndex, w)) return;
+      // OCR sometimes splits it: "06AAQCAT37EN1" + "ZU".
+      const next = row.words[i + 1];
+      if (next && next.x0 - w.x1 < (w.y1 - w.y0) * 1.5) tryText(w.text + next.text, rowIndex, w);
+    });
   });
-  return found;
+  // Prefer GSTINs that pass the check digit; drop near-duplicates of them (misreads of the same one).
+  const good = found.filter((f) => gstinChecksumOk(f.gstin));
+  return found.filter((f) => gstinChecksumOk(f.gstin) || !good.some((g) => gstinDistance(g.gstin, f.gstin) <= 3));
 }
 
 /** Split a row into horizontal segments (runs of words without a wide gap). */
@@ -275,18 +332,87 @@ function nameBelowLabel(rows: Row[], label: PartyLabel, lineHeight: number): str
   return null;
 }
 
-export function readHeader(rows: Row[], lineHeight: number): HeaderResult {
+/** Street-address words: the line above the first address line is the party's name. */
+const ADDRESS_WORD = /\b(mill|marg|road|rd|nagar|gate|floor|colony|mandi|bazar|bazaar|market|street|sector|plot|shop|complex|chowk|near|opp|#\d+)\b/i;
+
+/** Supplier name when its GSTIN wasn't readable: the line above the first address line. */
+function nameAboveAddress(rows: Row[], lineHeight: number): string | null {
+  const limit = Math.ceil(rows.length * 0.45);
+  for (let i = 1; i < limit; i++) {
+    const seg = segments(rows[i], lineHeight).find((s) => ADDRESS_WORD.test(s.map((w) => w.text).join(" ")));
+    if (!seg) continue;
+    const x0 = seg[0].x0;
+    for (let k = i - 1; k >= 0 && rows[i].y - rows[k].y < lineHeight * 3; k--) {
+      const above = segments(rows[k], lineHeight).find((s) => Math.abs(s[0].x0 - x0) < lineHeight * 3);
+      if (!above) continue;
+      const text = above.map((w) => w.text).join(" ").trim();
+      if (PARTY_LABEL.test(text) || PARTY_DETAIL.test(text) || !/[A-Za-z]{3}/.test(text)) break;
+      return text.replace(/[:\s]+$/, "").replace(/\s+/g, " ");
+    }
+    return null;
+  }
+  return null;
+}
+
+/** "JINDAL ELECTRONIC s" ≈ "JINDAL ELECTRONICS"; first distinctive word must match. */
+function textHasName(text: string, name: string): boolean {
+  const norm = (s: string) => s.toUpperCase().replace(/['’]/g, "").replace(/[^A-Z0-9]+/g, " ").trim();
+  const words = norm(text).split(" ");
+  const key = norm(name).split(" ").find((w) => w.length >= 4);
+  if (!key) return false;
+  return words.some((w) => w === key || (w.length >= 4 && Math.abs(w.length - key.length) <= 1 && editDistance(w, key) <= 1));
+}
+
+function editDistance(a: string, b: string): number {
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = cur;
+  }
+  return prev[b.length];
+}
+
+/** A known supplier whose GSTIN appears (even partly: 8+ characters in a row) or whose name appears. */
+function findKnownSupplier(rows: Row[], known: KnownSupplier[], ownGstin: string | null): KnownSupplier | null {
+  const top = rows.slice(0, Math.ceil(rows.length * 0.5));
+  const compact = top.map((r) => r.words.map((w) => w.text).join("").toUpperCase().replace(/[^A-Z0-9]/g, "")).join("|");
+  for (const s of known) {
+    if (!s.gstin || s.gstin === ownGstin) continue;
+    for (let start = 0; start + 8 <= 15; start++) {
+      if (compact.includes(s.gstin.slice(start, start + 8))) return s;
+    }
+  }
+  const text = top.map((r) => r.words.map((w) => w.text).join(" ")).join("\n");
+  return known.find((s) => s.gstin !== ownGstin && textHasName(text, s.name)) ?? null;
+}
+
+/** Tally invoice numbers carry the financial year: "2627/6669" → "26-27/6669". */
+function fixInvoiceNumber(raw: string | null): string | null {
+  if (!raw) return raw;
+  const m = /^(\d{2})[.\s]?(\d{2})\/(\d+)$/.exec(raw);
+  if (m && Number(m[2]) === Number(m[1]) + 1) return `${m[1]}-${m[2]}/${m[3]}`;
+  return raw;
+}
+
+export function readHeader(rows: Row[], lineHeight: number, options: HeaderOptions = {}): HeaderResult {
   const warnings: string[] = [];
+  const ownGstin = options.ownGstin ? options.ownGstin.toUpperCase() : null;
+  const isOwn = (g: string) => ownGstin !== null && gstinDistance(g, ownGstin) <= 3;
   const gstins = findGstins(rows);
   const supplierLabel = findPartyLabel(rows, SUPPLIER_LABEL, lineHeight);
   const buyerLabel = findPartyLabel(rows, BUYER_LABEL, lineHeight);
 
-  // Assign GSTINs to parties: by the label above them (if the bill has labels), else in
-  // reading order — the supplier's block comes first on Indian tax invoices.
+  // Assign GSTINs to parties: the shop's own GSTIN is the buyer; then by the label above
+  // them (if the bill has labels), else in reading order — the supplier's block comes first.
   let supplier: FoundGstin | null = null;
   let buyer: FoundGstin | null = null;
   const unassigned: FoundGstin[] = [];
   for (const g of gstins) {
+    if (isOwn(g.gstin)) {
+      buyer ??= g;
+      continue;
+    }
     const x0 = gstinBlockX0(rows, g, lineHeight);
     const under = (l: PartyLabel | null) => l !== null && l.rowIndex < g.rowIndex && Math.abs(l.x0 - x0) < lineHeight * 4;
     if (!supplier && under(supplierLabel)) supplier = g;
@@ -294,23 +420,37 @@ export function readHeader(rows: Row[], lineHeight: number): HeaderResult {
     else unassigned.push(g);
   }
   if (!supplier && !supplierLabel) supplier = unassigned.shift() ?? null;
-  if (!buyer && !buyerLabel) buyer = unassigned.shift() ?? null;
+  if (!buyer && !buyerLabel && !ownGstin) buyer = unassigned.shift() ?? null;
 
-  for (const g of [supplier, buyer]) {
-    if (g && !gstinChecksumOk(g.gstin)) warnings.push(`GSTIN ${g.gstin} fails its check digit — check for a misread character.`);
+  let supplierName =
+    (supplierLabel ? nameBelowLabel(rows, supplierLabel, lineHeight) : null) ??
+    (supplier ? partyNameAbove(rows, supplier, lineHeight) : null);
+  let supplierGstin = supplier?.gstin ?? null;
+
+  // Suppliers the shop already buys from: recognise them from fragments.
+  const known = options.knownSuppliers ?? [];
+  if (known.length) {
+    const byGstin = supplierGstin ? known.find((s) => s.gstin && gstinDistance(s.gstin, supplierGstin as string) <= 2) : undefined;
+    const match = byGstin ?? (!supplierGstin || !gstinChecksumOk(supplierGstin) ? findKnownSupplier(rows, known, ownGstin) : null);
+    if (match) {
+      supplierName = match.name;
+      supplierGstin = match.gstin ?? supplierGstin;
+    }
   }
-  if (!supplier) warnings.push("Supplier GSTIN not found.");
+  supplierName ??= nameAboveAddress(rows, lineHeight);
+
+  if (supplierGstin && !gstinChecksumOk(supplierGstin)) warnings.push(`GSTIN ${supplierGstin} fails its check digit — check for a misread character.`);
+  if (buyer && !isOwn(buyer.gstin) && !gstinChecksumOk(buyer.gstin)) warnings.push(`GSTIN ${buyer.gstin} fails its check digit — check for a misread character.`);
+  if (!supplierGstin) warnings.push("Supplier GSTIN not found.");
 
   const header: BillHeader = {
-    supplierName:
-      (supplierLabel ? nameBelowLabel(rows, supplierLabel, lineHeight) : null) ??
-      (supplier ? partyNameAbove(rows, supplier, lineHeight) : null),
-    supplierGstin: supplier?.gstin ?? null,
+    supplierName,
+    supplierGstin,
     buyerName:
       (buyerLabel ? nameBelowLabel(rows, buyerLabel, lineHeight) : null) ??
       (buyer ? partyNameAbove(rows, buyer, lineHeight) : null),
-    buyerGstin: buyer?.gstin ?? null,
-    invoiceNumber: findInvoiceNumber(rows, lineHeight),
+    buyerGstin: buyer ? (isOwn(buyer.gstin) && ownGstin ? ownGstin : buyer.gstin) : null,
+    invoiceNumber: fixInvoiceNumber(findInvoiceNumber(rows, lineHeight)),
     invoiceDate: findInvoiceDate(rows, lineHeight),
     irn: findIrn(rows, lineHeight),
   };

@@ -46,7 +46,7 @@ export function parseAmount(raw: string): ParsedAmount | null {
   let suspicious = false;
 
   text = text
-    .replace(/^(₹|rs\.?|inr)\s*/i, "")
+    .replace(RUPEE_MISREAD, "")
     .replace(/\/-$/, "")
     .replace(/\s+/g, "");
 
@@ -79,23 +79,91 @@ export function parseAmount(raw: string): ParsedAmount | null {
   return { value, suspicious };
 }
 
-/** True if the token looks like money (has paise, e.g. "45,000.00", "85.00"). */
+/** A ₹ sign read as another symbol ("X1,120.50", "¥2,59,110.00", "%1,800.00"). */
+const RUPEE_MISREAD = /^(₹|rs\.?|inr|[x%¥?€£])\s*(?=\d)/i;
+
+/** True if the token looks like money (has paise, e.g. "45,000.00", "85.00", "₹1,120.50"). */
 export function looksLikeMoney(raw: string): boolean {
-  return /^(₹|rs\.?)?\s*-?\d[\d,\s(;:'`]*\.\d{2}(\/-)?$/i.test(raw.trim());
+  return /^-?\d[\d,\s(;:'`]*\.\d{2}(\/-)?$/i.test(raw.trim().replace(RUPEE_MISREAD, ""));
 }
 
-/** Parse "2 PCS", "2PCS", "100 MTR", "1.5KG". Returns null if not a quantity with a unit. */
+/** A number read from a damaged OCR token, with other plausible readings. */
+export interface LooseNumber {
+  value: number;
+  /** Other readings worth trying (e.g. "1220000" may be 12,200.00 or 1220000). */
+  alts: number[];
+  /** 1 = cleanly printed, lower = more guesswork in the reading. */
+  quality: number;
+}
+
+const LOOSE_DIGIT_FIXES: Record<string, string> = { ...DIGIT_FIXES, s: "5", Z: "2", z: "2", g: "9" };
+
+/**
+ * Read a money value from OCR text that may be damaged. Bills print rates and amounts
+ * with paise, so lost separators are put back from that:
+ *   "1220000" → 12,200.00   "10 300 00" → 10,300.00   "26,101 69" → 26,101.69
+ *   "20.762.71" → 20,762.71   "12.627 12PCS" → 12,627.12   "8,305.08)" → 8,305.08
+ * The arithmetic checks decide whether the reading was right.
+ */
+export function parseLooseMoney(raw: string): LooseNumber | null {
+  let t = raw.trim().replace(RUPEE_MISREAD, "").replace(/\/-$/, "");
+  t = t.replace(/[A-Za-z]{2,}[|\])}!.]*$/, ""); // unit glued on the end: "12PCS", "pcs)"
+  t = t.replace(/(\d)[(;:'`](?=\d{2,3}\b)/g, "$1,"); // comma misread as ( ; : '
+  t = t.replace(/[|[\]{}()!"'‘’`;:_~]+/g, " ").trim();
+  const digitCount = (t.match(/\d/g) || []).length;
+  if (digitCount < 2) return null;
+  const letters = t.replace(/[\d.,\s]/g, "");
+  if (letters) {
+    if (letters.length > 2 || digitCount / t.replace(/\s/g, "").length < 0.6) return null;
+    t = t.replace(/[A-Za-z]/g, (c) => LOOSE_DIGIT_FIXES[c] ?? c);
+    if (/[A-Za-z]/.test(t)) return null;
+  }
+  const compact = t.replace(/\s+/g, "");
+  if (/^\d[\d,]*\.\d{2}$/.test(compact) && !/\s/.test(t)) {
+    const strict = parseAmount(compact);
+    if (strict) return { value: strict.value, alts: [], quality: strict.suspicious || letters ? 0.7 : 1 };
+  }
+  const groups = t.split(/[.,\s]+/).filter(Boolean);
+  const digits = groups.join("");
+  if (!/^\d+$/.test(digits)) return null;
+  const n = Number(digits);
+  const last = groups[groups.length - 1];
+  if (groups.length === 1) {
+    // No separators at all: the decimal point was lost (Tally always prints paise).
+    return { value: n / 100, alts: [n], quality: 0.6 };
+  }
+  if (last.length === 2) return { value: n / 100, alts: [], quality: 0.8 };
+  if (last.length === 1) return { value: n / 10, alts: [n / 100], quality: 0.5 }; // a paise digit lost
+  // "10,338" — rupees with the paise unreadable.
+  if (/,\d{3}$/.test(t)) return { value: n, alts: [n / 100], quality: 0.4 };
+  return { value: n / 100, alts: [n / 1000, n], quality: 0.3 };
+}
+
+/** OCR spellings of units: "pes", "pos", "PCs", "pce" → PCS. Null if not a unit. */
+export function normalizeUnit(raw: string): string | null {
+  const t = raw.trim().replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+  if (!t) return null;
+  if (UNITS.includes(t)) return t;
+  if (/^P[CEOG][S5Z]$/.test(t) || t === "PCSS") return "PCS";
+  if (/^N[O0][S5]$/.test(t)) return "NOS";
+  return null;
+}
+
+/** Units that count pieces (a "7 KG" inside a description is a size, not a quantity). */
+export const COUNT_UNITS = new Set(["PCS", "PC", "NOS", "NO", "SET", "SETS", "UNIT", "UNITS", "PAIR", "PRS", "BOX", "PKT"]);
+
+/** Parse "2 PCS", "2PCS", "100 MTR", "1.5KG", "2PCs|", "4 pes". Returns null if not a quantity with a unit. */
 export function parseQuantityWithUnit(raw: string): { value: number; unit: string } | null {
-  const m = /^(\d+(?:\.\d+)?)\s*([A-Za-z]{1,5})\.?$/.exec(raw.trim());
+  const m = /^(\d+(?:\.\d+)?)\s*([A-Za-z]{1,5})[.|\])}!]*$/.exec(raw.trim());
   if (!m) return null;
-  const unit = m[2].toUpperCase();
-  if (!UNITS.includes(unit)) return null;
+  const unit = normalizeUnit(m[2]);
+  if (!unit) return null;
   return { value: Number(m[1]), unit };
 }
 
-/** True if the text is a unit on its own ("PCS", "Nos"). */
+/** True if the text is a unit on its own ("PCS", "Nos", "pcs|"). */
 export function isUnit(raw: string): boolean {
-  return UNITS.includes(raw.trim().replace(/\.$/, "").toUpperCase());
+  return normalizeUnit(raw.replace(/[.|\])}!]+$/, "")) !== null;
 }
 
 /** HSN codes are 4, 6 or 8 digits. */

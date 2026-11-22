@@ -103,6 +103,11 @@ export function mergeFragments(words: OcrWord[], lineHeight: number): OcrWord[] 
         out[out.length - 1] = joinWords(prev, w, ",");
         continue;
       }
+      // An HSN code split in two: "84501" + "100" → "84501100".
+      if (/^\d{4,6}$/.test(prev.text) && /^\d{2,4}$/.test(w.text) && (prev.text + w.text).length === 8 && gap < lineHeight * 0.8) {
+        out[out.length - 1] = joinWords(prev, w, "");
+        continue;
+      }
     }
     out.push(w);
   }
@@ -145,7 +150,10 @@ export function headingKind(rawText: string): HeadingKind | null {
   if (/^taxable/.test(bare) || fuzzyIs(bare, "taxable")) return "taxable";
   if (/^(amount|amt)/.test(bare) || fuzzyIs(bare, "amount")) return "amount";
   if (/^(description|particulars|goods|items?|products?)$/.test(bare) || fuzzyIs(bare, "description")) return "description";
-  if (/^(gst|igst|gst%)$/.test(bare) || t === "%") return "gstPct";
+  if (/^(cgst|sgst|utgst|sgstutgst|igst)$/.test(bare)) return "tax";
+  if (/^(gst|gst%)$/.test(bare) || t === "%") return "gstPct";
+  if (/^total$/.test(bare)) return "total";
+  if (/^(disc|discount|disc%)$/.test(bare)) return "disc";
   if (bare === "per") return "per";
   if (/^(sl|si|sr|sno|slno|srno|no)$/.test(bare)) return "sl";
   return null;
@@ -165,21 +173,58 @@ export interface HeaderMatch {
  */
 export function findHeader(rows: Row[], lineHeight: number): HeaderMatch | null {
   for (let i = 0; i < rows.length; i++) {
-    const kinds = new Set(rows[i].words.map((w) => headingKind(w.text)).filter(Boolean));
+    const allKinds = rows[i].words.map((w) => headingKind(w.text)).filter(Boolean);
+    const kinds = new Set(allKinds);
     const core = ["description", "hsn", "qty", "rate", "amount"].filter((k) => kinds.has(k as HeadingKind));
-    if (core.length < 3) continue;
+    // "Quantity Rate Rate per" (Description / HSN unreadable) still marks the heading.
+    if (core.length < 3 && !(core.length === 2 && allKinds.length >= 4)) continue;
 
     let rowCount = 1;
     const next = rows[i + 1];
     if (next && next.y - rows[i].y < lineHeight * 1.9) {
       const nextKinds = next.words.map((w) => headingKind(w.text));
-      const nextIsHeading = next.words.every((w, k) => nextKinds[k] !== null || /^(of|tax\)?|\(.*|.*\)|no\.?|\(?₹\)?|%)$/i.test(w.text));
+      const nextIsHeading =
+        next.words.some((w, k) => nextKinds[k] !== null || /^(shipped|billed|value)$/i.test(w.text)) &&
+        next.words.every(
+          (w, k) => nextKinds[k] !== null || /^(of|tax\)?|\(.*|.*\)|no\.?|\(?₹\)?|%|shipped|billed|value|[|_\-]+)$/i.test(w.text)
+        );
       if (nextIsHeading) rowCount = 2;
     }
-    const words = rows.slice(i, i + rowCount).flatMap((r) => r.words);
-    return { index: i, rowCount, anchors: buildAnchors(words) };
+    if (rowCount === 1) return { index: i, rowCount, anchors: buildAnchors(rows[i].words) };
+
+    // Two-line heading. The second line holds "(incl. of Tax)" and sub-headings such as
+    // "Shipped Billed" under Quantity or "Rate Amount" under CGST / SGST / Total.
+    const top = rows[i].words;
+    const sub = rows[i + 1].words;
+    const anchors = buildAnchors([...top, ...sub.filter((w) => headingKind(w.text) === "incl" || !isSubHeading(w, top))]);
+    for (const w of sub) {
+      const kind = headingKind(w.text);
+      if (kind !== "rate" && kind !== "amount") continue;
+      const parent = nearestAnchor(anchors, centerX(w));
+      if (!parent || (parent.role !== "tax" && parent.role !== "total")) continue;
+      // "Amount" under CGST / SGST / Total marks where that column's numbers are;
+      // "Rate" under CGST / SGST is the tax % column.
+      if (kind === "amount") Object.assign(parent, { x: centerX(w), x0: w.x0, x1: w.x1 });
+      else anchors.push({ role: "gstPct", x: centerX(w), x0: w.x0, x1: w.x1 });
+    }
+    anchors.sort((a, b) => a.x - b.x);
+    return { index: i, rowCount, anchors };
   }
   return null;
+}
+
+function nearestAnchor(anchors: ColumnAnchor[], x: number): ColumnAnchor | undefined {
+  return [...anchors].sort((a, b) => Math.abs(a.x - x) - Math.abs(b.x - x))[0];
+}
+
+/** A second-line heading word sitting under a group heading (CGST, SGST, Total, Quantity). */
+function isSubHeading(w: OcrWord, top: OcrWord[]): boolean {
+  const kind = headingKind(w.text);
+  if (kind !== "rate" && kind !== "amount") return false;
+  const cx = centerX(w);
+  const nearest = [...top].filter((t) => headingKind(t.text)).sort((a, b) => Math.abs(centerX(a) - cx) - Math.abs(centerX(b) - cx))[0];
+  const k = nearest ? headingKind(nearest.text) : null;
+  return k === "tax" || k === "total" || k === "qty" || k === "taxable";
 }
 
 /** Turn heading words into column anchors (one per column, sorted left → right). */

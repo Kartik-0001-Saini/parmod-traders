@@ -29,7 +29,7 @@ export function toGray(pixels: ArrayLike<number>, width: number, height: number,
 }
 
 /** Grey → RGBA (for putting back on a canvas). */
-export function toRgba(img: GrayImage): Uint8ClampedArray {
+export function toRgba(img: GrayImage): Uint8ClampedArray<ArrayBuffer> {
   const out = new Uint8ClampedArray(img.width * img.height * 4);
   for (let i = 0, p = 0; i < img.data.length; i++, p += 4) {
     out[p] = out[p + 1] = out[p + 2] = img.data[i];
@@ -54,6 +54,19 @@ export function rotate(img: GrayImage, degrees: QuarterTurn): GrayImage {
     }
   }
   return { data: out, width: turned.w, height: turned.h };
+}
+
+/** Cut out a rectangle (clamped to the image). */
+export function crop(img: GrayImage, x0: number, y0: number, x1: number, y1: number): GrayImage {
+  const l = Math.max(0, Math.floor(x0));
+  const t = Math.max(0, Math.floor(y0));
+  const r = Math.min(img.width, Math.ceil(x1));
+  const b = Math.min(img.height, Math.ceil(y1));
+  const w = Math.max(1, r - l);
+  const h = Math.max(1, b - t);
+  const out = new Uint8ClampedArray(w * h);
+  for (let y = 0; y < h; y++) out.set(img.data.subarray((t + y) * img.width + l, (t + y) * img.width + l + w), y * w);
+  return { data: out, width: w, height: h };
 }
 
 /** Catmull-Rom cubic: sharp enough for enlarging text. */
