@@ -599,6 +599,7 @@ function ShowroomApp() {
         ) : (
           <>
             {/* 2. Big Blinkit-Style Search Bar (Under 5 seconds showroom lookup) */}
+            {(activeTab === "home" || activeTab === "catalog") && (
             <div className="relative">
               <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-400">
                 <Search className="w-5 h-5" />
@@ -620,6 +621,20 @@ function ShowroomApp() {
                 </button>
               )}
             </div>
+            )}
+
+            {/* 4. Dynamic Database Filters (Categories, Brands, Specs, Stock Status) */}
+            {(activeTab === "home" || activeTab === "catalog") && (
+              <DynamicFilters
+                filterOptions={dynamicFilterOptions}
+                activeFilters={activeFilters}
+                onChangeFilters={setActiveFilters}
+                onResetFilters={handleResetFilters}
+                totalFilteredCount={filteredProducts.length}
+                sortOption={sortOption}
+                onChangeSortOption={setSortOption}
+              />
+            )}
 
             {/* 3. Four Big Action Buttons (Blinkit Quick Tiles) */}
             {activeTab === "home" && !searchQuery && (
@@ -630,17 +645,6 @@ function ShowroomApp() {
                 onSearchClick={handleActionSearchClick}
               />
             )}
-
-            {/* 4. Dynamic Database Filters (Categories, Brands, Specs, Stock Status) */}
-            <DynamicFilters
-              filterOptions={dynamicFilterOptions}
-              activeFilters={activeFilters}
-              onChangeFilters={setActiveFilters}
-              onResetFilters={handleResetFilters}
-              totalFilteredCount={filteredProducts.length}
-              sortOption={sortOption}
-              onChangeSortOption={setSortOption}
-            />
 
             {/* Owner Add Product Button Banner */}
             {isOwner && (
