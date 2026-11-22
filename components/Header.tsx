@@ -10,6 +10,8 @@ interface HeaderProps {
   onOpenPinModal: () => void;
   onSwitchToCheckMode: () => void;
   onOpenAuthModal: () => void;
+  /** Optional content under the top row (e.g. laptop navigation tabs). Stays sticky with the header. */
+  children?: React.ReactNode;
 }
 
 export function Header({
@@ -17,6 +19,7 @@ export function Header({
   onOpenPinModal,
   onSwitchToCheckMode,
   onOpenAuthModal,
+  children,
 }: HeaderProps) {
   const { lang, toggleLang, t } = useLanguage();
   const { isAuthenticated, role } = useAuth();
@@ -113,6 +116,8 @@ export function Header({
           </button>
         </div>
       </div>
+
+      {children}
     </header>
   );
 }

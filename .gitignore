@@ -43,3 +43,6 @@ next-env.d.ts
 
 testbill/
 ocrenv/
+
+# OCR model cache (Tesseract)
+*.traineddata

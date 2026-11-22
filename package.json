@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "bills:read": "tsx scripts/test-bills.ts",
+    "test": "tsx --test lib/bill-reader/__tests__/bill-reader.test.ts"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.7",
@@ -14,18 +16,23 @@
     "clsx": "^2.1.1",
     "lucide-react": "^1.70.0",
     "next": "^16.4.6",
+    "pdfjs-dist": "^6.5.438",
     "react": "^18",
     "react-dom": "^18",
-    "tailwind-merge": "^3.7.0"
+    "tailwind-merge": "^3.7.0",
+    "tesseract.js": "^7.0.0"
   },
   "devDependencies": {
+    "@napi-rs/canvas": "^1.2.0",
     "@types/node": "^20",
     "@types/react": "^18",
     "@types/react-dom": "^18",
     "eslint": "^9.39.5",
     "eslint-config-next": "^16.4.6",
     "postcss": "^8",
+    "sharp": "^0.35.5",
     "tailwindcss": "^3.4.1",
+    "tsx": "^4.23.15",
     "typescript": "^5"
   }
 }

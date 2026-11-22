@@ -15,7 +15,8 @@ import {
   PackagePlus,
 } from "lucide-react";
 import { Header } from "@/components/Header";
-import { BottomNav, NavTab } from "@/components/BottomNav";
+import { BottomNav, DesktopTabs, NavTab } from "@/components/BottomNav";
+import { LoginScreen, AuthLoadingScreen } from "@/components/LoginScreen";
 import { ActionTiles } from "@/components/ActionTiles";
 import {
   DynamicFilters,
@@ -55,7 +56,21 @@ import {
  * 4. Skeleton Screen: ProductCardSkeleton renders instant card outlines while loading
  */
 
+/**
+ * Login gate: nothing (no inventory, search, bills) is shown or fetched until
+ * a staff/owner account is logged in. ShowroomApp is keyed by user id, so
+ * logging out unmounts it and clears all loaded data from memory.
+ */
 export default function HomePage() {
+  const { isAuthenticated, isLoading, user } = useAuth();
+
+  if (isLoading) return <AuthLoadingScreen />;
+  if (!isAuthenticated || !user) return <LoginScreen />;
+
+  return <ShowroomApp key={user.id} />;
+}
+
+function ShowroomApp() {
   const { lang, t } = useLanguage();
   const { isAuthenticated, role, fullName, user, isOwner } = useAuth();
 
@@ -492,7 +507,10 @@ export default function HomePage() {
         onOpenPinModal={() => setIsPinModalOpen(true)}
         onSwitchToCheckMode={() => setMode("check")}
         onOpenAuthModal={() => setIsAuthModalOpen(true)}
-      />
+      >
+        {/* Laptop / desktop navigation (phones use the BottomNav below) */}
+        <DesktopTabs activeTab={activeTab} onSelectTab={setActiveTab} />
+      </Header>
 
       <main className="max-w-5xl mx-auto px-4 pt-4 flex flex-col gap-3.5">
         {/* Notice Bar: Displays Active Authentication Status & Role */}
