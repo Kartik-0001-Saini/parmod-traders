@@ -137,6 +137,8 @@ function buildPoints(obsList: ValueObs[], q: number | null, g: number | null): P
         const weight = quality * meaningPrior(obs, m);
         const isRate = m === "rate" || m === "rateIncl";
         if (isRate && (q === null || q <= 0)) continue;
+        // No appliance costs more than ₹1 crore a piece: such a "rate" is a misread.
+        if (isRate && v > 1e7) continue;
         let t: number;
         // Rates are rounded to paise, so qty × rate can be off by ½ paisa per piece.
         let tol = 0.06 + (isRate ? 0.0051 * (q ?? 1) : 0);

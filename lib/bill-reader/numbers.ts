@@ -105,7 +105,18 @@ const LOOSE_DIGIT_FIXES: Record<string, string> = { ...DIGIT_FIXES, s: "5", Z: "
  *   "20.762.71" → 20,762.71   "12.627 12PCS" → 12,627.12   "8,305.08)" → 8,305.08
  * The arithmetic checks decide whether the reading was right.
  */
+/** No bill amount is this big; a bigger reading is two numbers glued together or junk. */
+export const MAX_BILL_AMOUNT = 1e9;
+
 export function parseLooseMoney(raw: string): LooseNumber | null {
+  const r = readLooseMoney(raw);
+  if (!r) return null;
+  const alts = r.alts.filter((a) => a < MAX_BILL_AMOUNT);
+  if (r.value < MAX_BILL_AMOUNT) return { ...r, alts };
+  return alts.length ? { value: alts[0], alts: alts.slice(1), quality: r.quality * 0.5 } : null;
+}
+
+function readLooseMoney(raw: string): LooseNumber | null {
   let t = raw.trim().replace(RUPEE_MISREAD, "").replace(/\/-$/, "");
   t = t.replace(/[A-Za-z]{2,}[|\])}!.]*$/, ""); // unit glued on the end: "12PCS", "pcs)"
   t = t.replace(/(\d)[(;:'`](?=\d{2,3}\b)/g, "$1,"); // comma misread as ( ; : '

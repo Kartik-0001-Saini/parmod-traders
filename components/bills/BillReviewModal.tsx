@@ -15,6 +15,7 @@ import type { BillRecord } from "@/lib/services/bill-service";
 import { getBillSignedUrlsForPages } from "@/lib/services/bill-service";
 import {
   ConfirmLineInput,
+  DB_LIMITS,
   StoredBillLine,
   confirmPurchaseBill,
   fetchBillLines,
@@ -165,7 +166,14 @@ export function BillReviewModal({ bill, onClose, onConfirmed }: BillReviewModalP
     const models = new Map<string, string>();
     for (const l of active) {
       const q = num(l.quantity);
-      if (q === null || q <= 0 || !Number.isInteger(q)) errors[l.key] = hi ? "मात्रा भरें (पूरे पीस)।" : "Enter the quantity (whole pieces).";
+      const tooBig =
+        (num(l.rateExcl) ?? 0) > DB_LIMITS.rate ||
+        (num(l.rateIncl) ?? 0) > DB_LIMITS.rate ||
+        (num(l.amount) ?? 0) > DB_LIMITS.amount ||
+        (num(l.gst) ?? 0) > DB_LIMITS.gst ||
+        [l.rateExcl, l.rateIncl, l.amount, l.gst].some((v) => (num(v) ?? 0) < 0);
+      if (tooBig) errors[l.key] = hi ? "कोई रेट/राशि गलत पढ़ी गई है (बहुत बड़ी) — ठीक करें।" : "A rate or amount is misread (far too large) — correct it.";
+      else if (q === null || q <= 0 || !Number.isInteger(q) || q > DB_LIMITS.quantity) errors[l.key] = hi ? "मात्रा भरें (पूरे पीस)।" : "Enter the quantity (whole pieces).";
       else if (l.mode === "existing" && !l.variantId) errors[l.key] = hi ? "प्रोडक्ट चुनें या नया बनाएं।" : "Choose the product, or create a new one.";
       else if (l.mode === "new") {
         const p = l.product;

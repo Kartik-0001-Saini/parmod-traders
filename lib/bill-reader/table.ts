@@ -137,8 +137,10 @@ function numericish(text: string): boolean {
   return digits >= 1 && digits / text.replace(/[\s|)\]}(!]/g, "").length >= 0.5;
 }
 
+/** Already a whole amount ("18,200.00", "15.429.79|", "18.200.00,"): don't glue the next number onto it. */
 function completeMoney(text: string): boolean {
-  return /\d[.,]\d{2}[|\])}!]*$/.test(text.trim()) && looksLikeMoney(text.replace(/[|\])}!]+$/, ""));
+  const t = text.trim().replace(/[|\])}!,.]+$/, "");
+  return /\d[.,]\d{2}$/.test(t) && (looksLikeMoney(t) || /^\d{1,3}([.,]\d{2,3})*[.,]\d{2}$/.test(t));
 }
 
 export function readItemRow(row: Row, anchors: ColumnAnchor[] | null, h: number): ItemRow {
@@ -182,7 +184,7 @@ export function readItemRow(row: Row, anchors: ColumnAnchor[] | null, h: number)
       unit = q.unit;
       continue;
     }
-    if (role === "qty" && /^\d+(\.\d+)?$/.test(t) && Number(t) > 0 && qtyIdx.length === 0) {
+    if (role === "qty" && /^\d+(\.\d+)?$/.test(t) && Number(t) > 0 && Number(t) <= 2000 && qtyIdx.length === 0) {
       qtyIdx.push(i);
       qty = Number(t);
       bareQty = true;

@@ -286,6 +286,8 @@ test("parseLooseMoney: separators lost or misread, as on WhatsApp photos", () =>
   assert.deepEqual(parseLooseMoney("8,305.08)"), { value: 8305.08, alts: [], quality: 1 });
   assert.equal(parseLooseMoney("X1,120.50")?.value, 1120.5, "₹ read as X");
   assert.equal(parseLooseMoney("WTT70DLIM"), null);
+  // Two prices glued together ("18.200.00,15.429.79") must never become one huge number.
+  assert.equal(parseLooseMoney("18.200.00,15.429.79"), null);
 });
 
 test("line solver: '400 PCS' is 4.00 PCS, a misread rate is rebuilt from amount ÷ qty", () => {

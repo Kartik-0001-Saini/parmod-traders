@@ -24,6 +24,9 @@ export function friendlyDbError(message: string): string {
   if (/Could not find the function|function .* does not exist/i.test(message)) {
     return "The database is missing the bill functions. Run supabase/migrations/012_bill_reading_and_confirm.sql in the Supabase SQL editor.";
   }
+  if (/numeric field overflow|out of range/i.test(message)) {
+    return "A number is far too large to be right (a misread). Check the rates, amounts and quantities.";
+  }
   return m
     .replace(/^DUPLICATE_BILL:\s*/, "Already saved: ")
     .replace(/^ALREADY_CONFIRMED:\s*/, "")
@@ -60,8 +63,27 @@ export async function downloadBillFiles(bill: BillRecord): Promise<{ blob: Blob;
 // Step 4: save what was read
 // ---------------------------------------------------------------------------
 
+/** Largest values the database columns hold (bill_lines rates NUMERIC(10,2), amounts NUMERIC(12,2) …). */
+export const DB_LIMITS = { rate: 99_999_999.99, amount: 9_999_999_999.99, gst: 100, quantity: 100_000, pieces: 1_000_000 };
+
+/** A number that can't be right (a misread) — or doesn't fit its column — is left empty for the owner. */
+function fits(v: number | null | undefined, max: number): number | null {
+  return v === null || v === undefined || !Number.isFinite(v) || v < 0 || v > max ? null : v;
+}
+
 function lineForDb(l: BillLine) {
-  return {
+  const flags = [...l.flags];
+  const uncertain = new Set(l.uncertainFields);
+  const keep = (v: number | null, max: number, column: string) => {
+    const ok = fits(v, max);
+    if (v !== null && ok === null) {
+      uncertain.add(column);
+      if (!flags.some((f) => f.startsWith("A number was misread"))) flags.push("A number was misread (far too large) — please enter it");
+    }
+    return ok;
+  };
+  const quantity = keep(l.quantity, DB_LIMITS.quantity, "quantity");
+  const row = {
     line_number: l.lineNo,
     raw_description: l.description,
     category: l.hints.category,
@@ -69,17 +91,20 @@ function lineForDb(l: BillLine) {
     size_spec: l.hints.sizeSpec,
     model_candidate: l.hints.modelCandidate,
     hsn_code: l.hsn,
-    quantity: l.quantity,
+    quantity,
     unit: l.unit,
-    rate_incl_tax: l.rateInclTax,
-    rate_excl_tax: l.rateExclTax,
-    line_amount: l.amount,
-    taxable_value: l.taxableValue,
+    rate_incl_tax: keep(l.rateInclTax, DB_LIMITS.rate, "rate_incl_tax"),
+    rate_excl_tax: keep(l.rateExclTax, DB_LIMITS.rate, "rate_excl_tax"),
+    line_amount: keep(l.amount, DB_LIMITS.amount, "line_amount"),
+    taxable_value: keep(l.taxableValue, DB_LIMITS.amount, "line_amount"),
     amount_includes_tax: l.amountIncludesTax,
-    gst_rate: l.gstRate,
-    is_uncertain: l.flags.length > 0,
-    uncertain_fields: l.uncertainFields,
-    flags: l.flags,
+    gst_rate: keep(l.gstRate, DB_LIMITS.gst, "gst_rate"),
+  };
+  return {
+    ...row,
+    is_uncertain: flags.length > 0,
+    uncertain_fields: Array.from(uncertain),
+    flags,
     auto_fixed: l.autoFixed,
   };
 }
@@ -92,12 +117,12 @@ export async function saveBillReading(billId: string, bill: ParsedBill): Promise
     invoice_number: bill.header.invoiceNumber,
     invoice_date: bill.header.invoiceDate,
     irn: bill.header.irn,
-    subtotal: bill.totals.subtotal,
-    cgst: bill.totals.cgst,
-    sgst: bill.totals.sgst,
-    igst: bill.totals.igst,
-    total_pieces: bill.totals.totalQuantity,
-    grand_total: bill.totals.grandTotal,
+    subtotal: fits(bill.totals.subtotal, DB_LIMITS.amount),
+    cgst: fits(bill.totals.cgst, DB_LIMITS.amount),
+    sgst: fits(bill.totals.sgst, DB_LIMITS.amount),
+    igst: fits(bill.totals.igst, DB_LIMITS.amount),
+    total_pieces: Number.isInteger(bill.totals.totalQuantity) ? fits(bill.totals.totalQuantity, DB_LIMITS.pieces) : null,
+    grand_total: fits(bill.totals.grandTotal, DB_LIMITS.amount),
     continued,
   };
   const extracted = {
